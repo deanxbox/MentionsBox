@@ -6,8 +6,9 @@
 
 import "./styles.css";
 
+import { definePluginSettings } from "@api/Settings";
 import ErrorBoundary from "@components/ErrorBoundary";
-import definePlugin, { type PluginAuthor } from "@utils/types";
+import definePlugin, { OptionType, type PluginAuthor } from "@utils/types";
 import type { MessageJSON } from "@vencord/discord-types";
 import { ChannelType } from "@vencord/discord-types/enums";
 import {
@@ -48,9 +49,67 @@ const Dean: PluginAuthor = {
 };
 
 const ROOT_ID = "vc-mentions-box-root";
-const MAX_VISIBLE_NOTICES = 5;
-const MAX_QUEUED_NOTICES = 50;
-const NOTICE_TTL = 1000 * 60 * 10;
+const DEFAULT_EXPIRATION_MINUTES = 10;
+const DEFAULT_STORED_MENTIONS = 50;
+
+const settings = definePluginSettings({
+    visibleMentions: {
+        type: OptionType.SLIDER,
+        description: "How many recent mention notifications to show at once",
+        markers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        default: 5,
+        stickToMarkers: true,
+        restartNeeded: false
+    },
+    storedMentions: {
+        type: OptionType.NUMBER,
+        description: "How many recent mention notifications to keep in the queue",
+        default: DEFAULT_STORED_MENTIONS,
+        restartNeeded: false,
+        componentProps: {
+            min: 1,
+            step: 1
+        },
+        onChange: trimStoredNotices,
+        isValid(value: number | string) {
+            const limit = Number(value);
+
+            if (!Number.isInteger(limit) || limit < 1) return "Use a whole number greater than 0";
+            return true;
+        }
+    },
+    neverExpire: {
+        type: OptionType.BOOLEAN,
+        description: "Never expire mention notifications automatically",
+        default: false,
+        restartNeeded: false,
+        onChange(isEnabled: boolean) {
+            if (!isEnabled) clearExpiredNotices();
+        }
+    },
+    expirationMinutes: {
+        type: OptionType.NUMBER,
+        description: "How many minutes mention notifications stay queued before expiring",
+        default: DEFAULT_EXPIRATION_MINUTES,
+        placeholder: `${DEFAULT_EXPIRATION_MINUTES}`,
+        restartNeeded: false,
+        componentProps: {
+            min: 1,
+            step: 1
+        },
+        onChange: clearExpiredNotices,
+        isValid(value: number | string) {
+            const minutes = Number(value);
+
+            if (!Number.isInteger(minutes) || minutes < 1) return "Use a whole number of minutes greater than 0";
+            return true;
+        }
+    }
+}, {
+    expirationMinutes: {
+        disabled() { return this.store.neverExpire; }
+    }
+});
 
 let root: ReturnType<typeof createRoot> | null = null;
 let notices: MentionNotice[] = [];
@@ -83,8 +142,21 @@ function removeNotice(id: string) {
 }
 
 function clearExpiredNotices() {
-    const cutoff = Date.now() - NOTICE_TTL;
+    if (settings.store.neverExpire) return;
+
+    const expirationMinutes = Number(settings.store.expirationMinutes) || DEFAULT_EXPIRATION_MINUTES;
+    const cutoff = Date.now() - expirationMinutes * 60_000;
     const nextNotices = notices.filter(notice => notice.timestamp >= cutoff);
+
+    if (nextNotices.length !== notices.length) setNotices(nextNotices);
+}
+
+function getStoredMentionsLimit() {
+    return Math.max(1, Math.floor(Number(settings.store.storedMentions) || DEFAULT_STORED_MENTIONS));
+}
+
+function trimStoredNotices() {
+    const nextNotices = notices.slice(0, getStoredMentionsLimit());
 
     if (nextNotices.length !== notices.length) setNotices(nextNotices);
 }
@@ -93,7 +165,7 @@ function addNotice(notice: MentionNotice) {
     setNotices([
         notice,
         ...notices.filter(existing => existing.id !== notice.id)
-    ].slice(0, MAX_QUEUED_NOTICES));
+    ].slice(0, getStoredMentionsLimit()));
 }
 
 function getAuthorName(message: MessageJSON) {
@@ -202,12 +274,14 @@ function MentionsBox() {
         []
     );
     const currentNotices = useNotices();
+    const { visibleMentions } = settings.use(["visibleMentions"]);
+    const visibleLimit = Math.max(1, Math.floor(Number(visibleMentions) || 5));
     const visibleNotices = useMemo(
-        () => currentChannelId ? currentNotices.slice(0, MAX_VISIBLE_NOTICES) : [],
-        [currentChannelId, currentNotices]
+        () => currentChannelId ? currentNotices.slice(0, visibleLimit) : [],
+        [currentChannelId, currentNotices, visibleLimit]
     );
     const queuedCount = currentChannelId
-        ? Math.max(currentNotices.length - MAX_VISIBLE_NOTICES, 0)
+        ? Math.max(currentNotices.length - visibleLimit, 0)
         : 0;
 
     if (!visibleNotices.length) return null;
@@ -252,6 +326,7 @@ export default definePlugin({
     description: "Shows clickable top-screen cards for recent mentions and jumps to the message when clicked.",
     tags: ["Chat", "Notifications"],
     authors: [Dean],
+    settings,
 
     start() {
         mountRoot();
