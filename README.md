@@ -8,19 +8,23 @@ MentionsBox is a simple Vencord user plugin that shows recent mentions in a clea
 - Works across servers, DMs, and group DMs.
 - Click a notification to jump directly to the mentioned message.
 - Dismiss notifications without jumping by clicking the `x`.
+- React to the mentioned message from the notification with your five most-used reaction emojis.
+- Reply to the mentioned message directly from the notification.
 - Keeps a queue of recent mentions so older pings are not lost when more arrive than can be shown.
 - Lets you choose how many recent mention notifications are displayed at once.
 - Lets you choose how many recent mention notifications are stored in the queue.
+- Lets you choose whether notifications are shown newest-first or oldest-first.
 - Lets you choose how long notifications stay queued before expiring.
 - Includes a Never Expire toggle that disables automatic expiration.
 - Uses Discord-style dark theme surfaces and high-contrast text.
 
 ## Settings
 
-MentionsBox adds three settings to the Vencord plugin settings page:
+MentionsBox adds several settings to the Vencord plugin settings page:
 
 - `visibleMentions`: choose how many recent mentions to show at once.
 - `storedMentions`: enter how many recent mentions to keep in the queue.
+- `sortOrder`: choose whether the notification stack shows newest mentions first or oldest mentions first.
 - `neverExpire`: keep notifications until you click or dismiss them.
 - `expirationMinutes`: choose how many minutes notifications stay queued before expiring. This setting is disabled while Never Expire is enabled.
 
@@ -34,6 +38,14 @@ By default, notifications expire after 10 minutes. If Never Expire is enabled, n
 
 - `index.tsx` contains the mention detection, queue logic, and React notification UI.
 - `styles.css` contains the Discord-themed notification styling.
+
+## Quick Reactions
+
+Each notification shows up to five of your most-used reaction emojis, matching Discord's quick reaction behavior. The buttons use Discord-rendered emoji images. Clicking one reacts to the mentioned message and highlights it in the notification; clicking it again removes that reaction and clears the highlight.
+
+## Reply Bar
+
+Each notification includes a compact reply bar for sending a reply to the mentioned message without leaving the current channel. Replies are sent without pinging the original author by default.
 
 ## Verification
 

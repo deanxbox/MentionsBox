@@ -9,13 +9,18 @@ import "./styles.css";
 import { definePluginSettings } from "@api/Settings";
 import ErrorBoundary from "@components/ErrorBoundary";
 import definePlugin, { OptionType, type PluginAuthor } from "@utils/types";
-import type { MessageJSON } from "@vencord/discord-types";
+import type { Emoji, MessageJSON } from "@vencord/discord-types";
 import { ChannelType } from "@vencord/discord-types/enums";
+import { findByPropsLazy } from "@webpack";
 import {
     ChannelStore,
+    Constants,
     createRoot,
+    EmojiStore,
+    IconUtils,
     NavigationRouter,
     RelationshipStore,
+    RestAPI,
     SelectedChannelStore,
     useCallback,
     useEffect,
@@ -40,7 +45,14 @@ interface MentionNotice {
     avatarUrl?: string;
     channelName: string;
     content: string;
+    reactedEmojiKeys: string[];
     timestamp: number;
+}
+
+interface ReplyMessageReference {
+    channel_id: string;
+    message_id: string;
+    guild_id?: string;
 }
 
 const Dean: PluginAuthor = {
@@ -51,6 +63,14 @@ const Dean: PluginAuthor = {
 const ROOT_ID = "vc-mentions-box-root";
 const DEFAULT_EXPIRATION_MINUTES = 10;
 const DEFAULT_STORED_MENTIONS = 50;
+const QUICK_REACTION_COUNT = 5;
+
+const EmojiUtils = findByPropsLazy("getURL", "getEmojiColors");
+
+const enum SortOrder {
+    Newest = "newest",
+    Oldest = "oldest"
+}
 
 const settings = definePluginSettings({
     visibleMentions: {
@@ -77,6 +97,15 @@ const settings = definePluginSettings({
             if (!Number.isInteger(limit) || limit < 1) return "Use a whole number greater than 0";
             return true;
         }
+    },
+    sortOrder: {
+        type: OptionType.SELECT,
+        description: "Which mentions appear first in the notification stack",
+        options: [
+            { label: "Newest first", value: SortOrder.Newest, default: true },
+            { label: "Oldest first", value: SortOrder.Oldest }
+        ],
+        restartNeeded: false
     },
     neverExpire: {
         type: OptionType.BOOLEAN,
@@ -139,6 +168,21 @@ function setNotices(nextNotices: MentionNotice[]) {
 
 function removeNotice(id: string) {
     setNotices(notices.filter(notice => notice.id !== id));
+}
+
+function setNoticeReactionState(noticeId: string, emojiKey: string, isReacted: boolean) {
+    setNotices(notices.map(notice => {
+        if (notice.id !== noticeId) return notice;
+
+        const reactedEmojiKeys = new Set(notice.reactedEmojiKeys);
+        if (isReacted) reactedEmojiKeys.add(emojiKey);
+        else reactedEmojiKeys.delete(emojiKey);
+
+        return {
+            ...notice,
+            reactedEmojiKeys: [...reactedEmojiKeys]
+        };
+    }));
 }
 
 function clearExpiredNotices() {
@@ -210,6 +254,89 @@ function isRelevantMention(message: MessageJSON) {
     return message.mentions?.some(user => user.id === currentUser.id) ?? false;
 }
 
+function getEmojiLabel(emoji: Emoji) {
+    return emoji.id ? `:${emoji.name}:` : emoji.name;
+}
+
+function getEmojiKey(emoji: Emoji) {
+    return emoji.id ?? emoji.name;
+}
+
+function getEmojiImageUrl(emoji: Emoji) {
+    if (!emoji.id) return EmojiUtils.getURL(getUnicodeEmojiSurrogates(emoji));
+
+    return IconUtils.getEmojiURL({
+        id: emoji.id,
+        animated: emoji.animated,
+        size: 32
+    });
+}
+
+function getUnicodeEmojiSurrogates(emoji: Emoji) {
+    return "surrogates" in emoji ? emoji.surrogates : emoji.name;
+}
+
+function getReactionKey(emoji: Emoji) {
+    return emoji.id
+        ? `${emoji.name}:${emoji.id}`
+        : getUnicodeEmojiSurrogates(emoji);
+}
+
+function getQuickReactionEmojis(guildId: string | null) {
+    return EmojiStore
+        .getDisambiguatedEmojiContext(guildId)
+        .getFrequentlyUsedReactionEmojisWithoutFetchingLatest()
+        .slice(0, QUICK_REACTION_COUNT);
+}
+
+async function setReactionOnNotice(notice: MentionNotice, emoji: Emoji, isReacted: boolean) {
+    const emojiKey = getReactionKey(emoji);
+    const url = `${Constants.Endpoints.REACTIONS(notice.channelId, notice.id, emojiKey)}/@me`;
+    const request = {
+        url,
+        query: {
+            location: "Message",
+            type: 0
+        },
+        oldFormErrors: true
+    };
+
+    setNoticeReactionState(notice.id, emojiKey, isReacted);
+
+    try {
+        if (isReacted) await RestAPI.put(request);
+        else await RestAPI.del(request);
+    } catch (error) {
+        setNoticeReactionState(notice.id, emojiKey, !isReacted);
+        console.error("[MentionsBox] Failed to update reaction", error);
+    }
+}
+
+async function sendReplyToNotice(notice: MentionNotice, content: string) {
+    const messageReference: ReplyMessageReference = {
+        channel_id: notice.channelId,
+        message_id: notice.id
+    };
+    if (notice.guildId) messageReference.guild_id = notice.guildId;
+
+    await RestAPI.post({
+        url: Constants.Endpoints.MESSAGES(notice.channelId),
+        body: {
+            allowed_mentions: {
+                parse: [],
+                replied_user: false
+            },
+            channel_id: notice.channelId,
+            content,
+            flags: 0,
+            message_reference: messageReference,
+            nonce: `${Date.now()}`,
+            tts: false,
+            type: 0
+        }
+    });
+}
+
 function useNotices() {
     const [currentNotices, setCurrentNotices] = useState(getSnapshot);
 
@@ -219,6 +346,13 @@ function useNotices() {
 }
 
 function MentionCard({ notice }: { notice: MentionNotice; }) {
+    const [replyContent, setReplyContent] = useState("");
+    const [isSendingReply, setIsSendingReply] = useState(false);
+    const quickReactionEmojis = useMemo(
+        () => getQuickReactionEmojis(notice.guildId),
+        [notice.guildId]
+    );
+
     const jumpToMention = useCallback(() => {
         removeNotice(notice.id);
         NavigationRouter.transitionTo(`/channels/${notice.guildId ?? "@me"}/${notice.channelId}/${notice.id}`);
@@ -229,7 +363,36 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         removeNotice(notice.id);
     }, [notice.id]);
 
+    const handleReplyChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+        setReplyContent(event.currentTarget.value);
+    }, []);
+
+    const submitReply = useCallback(async (event: React.FormEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const content = replyContent.trim();
+        if (!content || isSendingReply) return;
+
+        setIsSendingReply(true);
+        try {
+            await sendReplyToNotice(notice, content);
+            setReplyContent("");
+        } catch (error) {
+            console.error("[MentionsBox] Failed to send reply", error);
+        } finally {
+            setIsSendingReply(false);
+        }
+    }, [isSendingReply, notice, replyContent]);
+
+    const reactToMention = useCallback((event: React.MouseEvent, emoji: Emoji, isReacted: boolean) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void setReactionOnNotice(notice, emoji, !isReacted);
+    }, [notice]);
+
     const handleKeyDown = useCallback((event: React.KeyboardEvent) => {
+        if (event.target !== event.currentTarget) return;
         if (event.key !== "Enter" && event.key !== " ") return;
 
         event.preventDefault();
@@ -237,32 +400,81 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
     }, [jumpToMention]);
 
     return (
-        <div
-            className="vc-mentions-box-card"
-            onClick={jumpToMention}
-            onKeyDown={handleKeyDown}
-            role="button"
-            tabIndex={0}
-        >
+        <div className="vc-mentions-box-card">
             <div className="vc-mentions-box-accent" />
-            {notice.avatarUrl ? (
-                <img className="vc-mentions-box-avatar" src={notice.avatarUrl} alt="" />
-            ) : (
-                <div className="vc-mentions-box-avatar vc-mentions-box-avatar-fallback">
-                    {notice.authorName.slice(0, 1).toUpperCase()}
+            <div className="vc-mentions-box-body">
+                <div
+                    className="vc-mentions-box-main"
+                    onClick={jumpToMention}
+                    onKeyDown={handleKeyDown}
+                    role="button"
+                    tabIndex={0}
+                >
+                    {notice.avatarUrl ? (
+                        <img className="vc-mentions-box-avatar" src={notice.avatarUrl} alt="" />
+                    ) : (
+                        <div className="vc-mentions-box-avatar vc-mentions-box-avatar-fallback">
+                            {notice.authorName.slice(0, 1).toUpperCase()}
+                        </div>
+                    )}
+                    <div className="vc-mentions-box-copy">
+                        <div className="vc-mentions-box-meta">
+                            <span className="vc-mentions-box-author">{notice.authorName}</span>
+                            <span className="vc-mentions-box-channel">{notice.channelName}</span>
+                        </div>
+                        <div className="vc-mentions-box-content">{notice.content}</div>
+                    </div>
+                    <div className="vc-mentions-box-actions">
+                        {quickReactionEmojis.length > 0 && (
+                            <div className="vc-mentions-box-reactions" aria-label="Quick reactions">
+                                {quickReactionEmojis.map(emoji => {
+                                    const imageUrl = getEmojiImageUrl(emoji);
+                                    const label = getEmojiLabel(emoji);
+                                    const isReacted = notice.reactedEmojiKeys.includes(getReactionKey(emoji));
+
+                                    return (
+                                        <button
+                                            key={getEmojiKey(emoji)}
+                                            type="button"
+                                            className={`vc-mentions-box-reaction${isReacted ? " vc-mentions-box-reaction-selected" : ""}`}
+                                            onClick={event => reactToMention(event, emoji, isReacted)}
+                                            aria-label={`${isReacted ? "Remove" : "React with"} ${label}`}
+                                            aria-pressed={isReacted}
+                                            title={`${isReacted ? "Remove" : "React with"} ${label}`}
+                                        >
+                                            {imageUrl ? (
+                                                <img className="vc-mentions-box-reaction-img" src={imageUrl} alt="" />
+                                            ) : (
+                                                <span className="vc-mentions-box-reaction-unicode">{getEmojiLabel(emoji)}</span>
+                                            )}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        )}
+                        <span className="vc-mentions-box-jump">Jump</span>
+                        <button className="vc-mentions-box-dismiss" type="button" onClick={dismissNotice} aria-label="Dismiss mention">
+                            x
+                        </button>
+                    </div>
                 </div>
-            )}
-            <div className="vc-mentions-box-copy">
-                <div className="vc-mentions-box-meta">
-                    <span className="vc-mentions-box-author">{notice.authorName}</span>
-                    <span className="vc-mentions-box-channel">{notice.channelName}</span>
-                </div>
-                <div className="vc-mentions-box-content">{notice.content}</div>
+                <form className="vc-mentions-box-reply" onSubmit={submitReply} onClick={event => event.stopPropagation()}>
+                    <input
+                        className="vc-mentions-box-reply-input"
+                        value={replyContent}
+                        onChange={handleReplyChange}
+                        placeholder={`Reply to ${notice.authorName}`}
+                        disabled={isSendingReply}
+                    />
+                    <button
+                        className="vc-mentions-box-reply-send"
+                        disabled={!replyContent.trim() || isSendingReply}
+                        type="submit"
+                    >
+                        Reply
+                    </button>
+                </form>
             </div>
-            <span className="vc-mentions-box-jump">Jump</span>
-            <button className="vc-mentions-box-dismiss" onClick={dismissNotice} aria-label="Dismiss mention">
-                x
-            </button>
         </div>
     );
 }
@@ -274,11 +486,15 @@ function MentionsBox() {
         []
     );
     const currentNotices = useNotices();
-    const { visibleMentions } = settings.use(["visibleMentions"]);
+    const { sortOrder, visibleMentions } = settings.use(["sortOrder", "visibleMentions"]);
     const visibleLimit = Math.max(1, Math.floor(Number(visibleMentions) || 5));
+    const sortedNotices = useMemo(
+        () => sortOrder === SortOrder.Oldest ? [...currentNotices].reverse() : currentNotices,
+        [currentNotices, sortOrder]
+    );
     const visibleNotices = useMemo(
-        () => currentChannelId ? currentNotices.slice(0, visibleLimit) : [],
-        [currentChannelId, currentNotices, visibleLimit]
+        () => currentChannelId ? sortedNotices.slice(0, visibleLimit) : [],
+        [currentChannelId, sortedNotices, visibleLimit]
     );
     const queuedCount = currentChannelId
         ? Math.max(currentNotices.length - visibleLimit, 0)
@@ -358,6 +574,7 @@ export default definePlugin({
                 avatarUrl: author?.getAvatarURL?.(undefined, 64),
                 channelName: getChannelName(channel),
                 content: formatContent(message),
+                reactedEmojiKeys: [],
                 timestamp: Date.now()
             });
         }
