@@ -36,6 +36,15 @@ interface MessageCreatePayload {
     message: MessageJSON;
 }
 
+interface MessageReactionPayload {
+    channelId?: string;
+    channel_id?: string;
+    messageId?: string;
+    message_id?: string;
+    userId?: string;
+    user_id?: string;
+}
+
 interface MentionNotice {
     id: string;
     channelId: string;
@@ -64,6 +73,7 @@ const ROOT_ID = "vc-mentions-box-root";
 const DEFAULT_EXPIRATION_MINUTES = 10;
 const DEFAULT_STORED_MENTIONS = 50;
 const QUICK_REACTION_COUNT = 5;
+const MENTION_BOX_REACTION_SUPPRESSION_MS = 2_000;
 
 const EmojiUtils = findByPropsLazy("getURL", "getEmojiColors");
 
@@ -107,6 +117,12 @@ const settings = definePluginSettings({
         ],
         restartNeeded: false
     },
+    jumpOnReply: {
+        type: OptionType.BOOLEAN,
+        description: "Jump to the mentioned message after replying from the notification",
+        default: false,
+        restartNeeded: false
+    },
     neverExpire: {
         type: OptionType.BOOLEAN,
         description: "Never expire mention notifications automatically",
@@ -145,6 +161,7 @@ let notices: MentionNotice[] = [];
 let pruneInterval: ReturnType<typeof setInterval> | null = null;
 
 const listeners = new Set<() => void>();
+const mentionBoxReactionMessageIds = new Set<string>();
 
 function emitChange() {
     for (const listener of listeners) listener();
@@ -168,6 +185,50 @@ function setNotices(nextNotices: MentionNotice[]) {
 
 function removeNotice(id: string) {
     setNotices(notices.filter(notice => notice.id !== id));
+}
+
+function removeNoticeForMessage(messageId?: string, channelId?: string) {
+    if (!messageId) return false;
+
+    const nextNotices = notices.filter(notice => {
+        if (notice.id !== messageId) return true;
+        return channelId ? notice.channelId !== channelId : false;
+    });
+
+    if (nextNotices.length === notices.length) return false;
+    setNotices(nextNotices);
+    return true;
+}
+
+function removeNoticeForReply(message: MessageJSON) {
+    const reference = message.message_reference;
+
+    return removeNoticeForMessage(reference?.message_id, reference?.channel_id);
+}
+
+function jumpToNotice(notice: MentionNotice) {
+    NavigationRouter.transitionTo(`/channels/${notice.guildId ?? "@me"}/${notice.channelId}/${notice.id}`);
+}
+
+function getReactionPayloadMessageId(payload: MessageReactionPayload) {
+    return payload.messageId ?? payload.message_id;
+}
+
+function getReactionPayloadChannelId(payload: MessageReactionPayload) {
+    return payload.channelId ?? payload.channel_id;
+}
+
+function getReactionPayloadUserId(payload: MessageReactionPayload) {
+    return payload.userId ?? payload.user_id;
+}
+
+function shouldIgnoreMentionBoxReaction(messageId: string) {
+    return mentionBoxReactionMessageIds.has(messageId);
+}
+
+function markMentionBoxReaction(messageId: string) {
+    mentionBoxReactionMessageIds.add(messageId);
+    setTimeout(() => mentionBoxReactionMessageIds.delete(messageId), MENTION_BOX_REACTION_SUPPRESSION_MS);
 }
 
 function setNoticeReactionState(noticeId: string, emojiKey: string, isReacted: boolean) {
@@ -301,6 +362,7 @@ async function setReactionOnNotice(notice: MentionNotice, emoji: Emoji, isReacte
         oldFormErrors: true
     };
 
+    markMentionBoxReaction(notice.id);
     setNoticeReactionState(notice.id, emojiKey, isReacted);
 
     try {
@@ -324,7 +386,7 @@ async function sendReplyToNotice(notice: MentionNotice, content: string) {
         body: {
             allowed_mentions: {
                 parse: [],
-                replied_user: false
+                replied_user: true
             },
             channel_id: notice.channelId,
             content,
@@ -355,7 +417,7 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
 
     const jumpToMention = useCallback(() => {
         removeNotice(notice.id);
-        NavigationRouter.transitionTo(`/channels/${notice.guildId ?? "@me"}/${notice.channelId}/${notice.id}`);
+        jumpToNotice(notice);
     }, [notice]);
 
     const dismissNotice = useCallback((event: React.MouseEvent) => {
@@ -378,6 +440,8 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         try {
             await sendReplyToNotice(notice, content);
             setReplyContent("");
+            removeNotice(notice.id);
+            if (settings.store.jumpOnReply) jumpToNotice(notice);
         } catch (error) {
             console.error("[MentionsBox] Failed to send reply", error);
         } finally {
@@ -558,6 +622,9 @@ export default definePlugin({
 
     flux: {
         MESSAGE_CREATE({ message, channelId, guildId }: MessageCreatePayload) {
+            const currentUser = UserStore.getCurrentUser();
+
+            if (message?.author?.id === currentUser?.id && removeNoticeForReply(message)) return;
             if (!message?.id || message.state === "SENDING" || !isRelevantMention(message)) return;
 
             const resolvedChannelId = message.channel_id ?? channelId;
@@ -577,6 +644,16 @@ export default definePlugin({
                 reactedEmojiKeys: [],
                 timestamp: Date.now()
             });
+        },
+
+        MESSAGE_REACTION_ADD(payload: MessageReactionPayload) {
+            const currentUser = UserStore.getCurrentUser();
+            const messageId = getReactionPayloadMessageId(payload);
+
+            if (!messageId || getReactionPayloadUserId(payload) !== currentUser?.id) return;
+            if (shouldIgnoreMentionBoxReaction(messageId)) return;
+
+            removeNoticeForMessage(messageId, getReactionPayloadChannelId(payload));
         }
     }
 });

@@ -10,6 +10,7 @@ MentionsBox is a simple Vencord user plugin that shows recent mentions in a clea
 - Dismiss notifications without jumping by clicking the `x`.
 - React to the mentioned message from the notification with your five most-used reaction emojis.
 - Reply to the mentioned message directly from the notification.
+- Optionally jump to the mentioned message after replying from the notification.
 - Keeps a queue of recent mentions so older pings are not lost when more arrive than can be shown.
 - Lets you choose how many recent mention notifications are displayed at once.
 - Lets you choose how many recent mention notifications are stored in the queue.
@@ -25,6 +26,7 @@ MentionsBox adds several settings to the Vencord plugin settings page:
 - `visibleMentions`: choose how many recent mentions to show at once.
 - `storedMentions`: enter how many recent mentions to keep in the queue.
 - `sortOrder`: choose whether the notification stack shows newest mentions first or oldest mentions first.
+- `jumpOnReply`: jump to the mentioned message after replying from the notification.
 - `neverExpire`: keep notifications until you click or dismiss them.
 - `expirationMinutes`: choose how many minutes notifications stay queued before expiring. This setting is disabled while Never Expire is enabled.
 
@@ -32,7 +34,9 @@ MentionsBox adds several settings to the Vencord plugin settings page:
 
 MentionsBox stores queued mentions according to your stored mention count. The newest notifications are displayed according to your visible mention count. When a visible notification is clicked or dismissed, the next queued mention appears automatically.
 
-By default, notifications expire after 10 minutes. If Never Expire is enabled, notifications are only removed when clicked, dismissed, or when the plugin is disabled or reloaded.
+Notifications are also removed when you reply to or react to the mentioned message from Discord's normal chat UI.
+
+By default, notifications expire after 10 minutes. If Never Expire is enabled, notifications are only removed when clicked, dismissed, responded to, or when the plugin is disabled or reloaded.
 
 ## Files
 
@@ -45,7 +49,7 @@ Each notification shows up to five of your most-used reaction emojis, matching D
 
 ## Reply Bar
 
-Each notification includes a compact reply bar for sending a reply to the mentioned message without leaving the current channel. Replies are sent without pinging the original author by default.
+Each notification includes a compact reply bar for sending a reply to the mentioned message without leaving the current channel. Replies mention the original author. If `jumpOnReply` is enabled, MentionsBox jumps to the mentioned message after the reply sends.
 
 ## Verification
 
