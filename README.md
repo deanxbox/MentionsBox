@@ -6,10 +6,14 @@ MentionsBox is a simple Vencord user plugin that shows recent mentions in a clea
 
 - Shows a top-screen notification when someone mentions you.
 - Works across servers, DMs, and group DMs.
+- Shows the server and channel for server mentions.
 - Click a notification to jump directly to the mentioned message.
 - Dismiss notifications without jumping by clicking the `x`.
 - React to the mentioned message from the notification with your five most-used reaction emojis.
 - Reply to the mentioned message directly from the notification.
+- Expand notifications to preview reply chains and new replies.
+- Renders Discord emoji, custom emoji, stickers, GIFs, and image previews inside mention notifications.
+- Adds Read more controls for longer message previews.
 - Optionally jump to the mentioned message after replying from the notification.
 - Keeps a queue of recent mentions so older pings are not lost when more arrive than can be shown.
 - Lets you choose how many recent mention notifications are displayed at once.
@@ -50,6 +54,14 @@ Each notification shows up to five of your most-used reaction emojis, matching D
 ## Reply Bar
 
 Each notification includes a compact reply bar for sending a reply to the mentioned message without leaving the current channel. Replies mention the original author. If `jumpOnReply` is enabled, MentionsBox jumps to the mentioned message after the reply sends.
+
+## Reply Chains
+
+When a mentioned message is part of a reply chain, MentionsBox walks the linked replies until there are no more referenced messages and stores a compact preview of the full available chain. If new replies arrive while the notification is still queued, replies linked anywhere in that chain are stored too. Use the Show replies toggle on the notification to expand or collapse this context; expanded messages include author avatars.
+
+## Rich Previews
+
+Mention content is rendered through Discord's parser so Discord emoji and custom emoji display inline instead of falling back to plain text. Supported stickers, GIF embeds, and image or GIF attachments render as compact media previews beneath the message text. MentionsBox also refreshes tracked messages in the background so late-loaded embeds, stickers, and GIF previews can populate without navigating to the message.
 
 ## Verification
 
