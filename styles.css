@@ -218,9 +218,11 @@
 
 .vc-mentions-box-content-expanded,
 .vc-mentions-box-content--expanded {
-    overflow: visible;
+    overflow: hidden;
     text-overflow: clip;
     white-space: pre-wrap;
+    word-break: break-word;
+    overflow-wrap: anywhere;
 }
 
 .vc-mentions-box-read-more {
@@ -358,6 +360,58 @@
     line-height: 1;
 }
 
+.vc-mentions-box-message-reactions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 6px;
+}
+
+.vc-mentions-box-message-reaction {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 24px;
+    padding: 0 8px;
+    color: var(--text-normal);
+    font-size: 12px;
+    font-weight: 500;
+    font-family: inherit;
+    background: var(--background-modifier-accent);
+    border: 1px solid transparent;
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+.vc-mentions-box-message-reaction--mine {
+    background: color-mix(in oklab, var(--brand-500) 22%, transparent);
+    border-color: var(--brand-500);
+}
+
+.vc-mentions-box-message-reaction:hover {
+    background: var(--background-modifier-hover);
+    border-color: var(--background-modifier-accent);
+}
+
+.vc-mentions-box-message-reaction--mine:hover {
+    background: color-mix(in oklab, var(--brand-500) 32%, transparent);
+}
+
+.vc-mentions-box-message-reaction-img {
+    width: 16px;
+    height: 16px;
+    object-fit: contain;
+}
+
+.vc-mentions-box-message-reaction-unicode {
+    font-size: 14px;
+    line-height: 1;
+}
+
+.vc-mentions-box-message-reaction-count {
+    color: var(--text-muted);
+}
+
 .vc-mentions-box-reaction-more {
     color: var(--text-muted);
     font-size: 20px;
@@ -407,7 +461,8 @@
     width: 100%;
     height: 40px;
     padding: 0 12px 0 38px;
-    color: var(--text-normal);
+    color: var(--white-500);
+    caret-color: var(--white-500);
     font-size: 15px;
     background: var(--background-secondary, #2b2d31);
     border: 1px solid var(--background-modifier-accent);
@@ -521,6 +576,7 @@
     height: 44px;
     padding: 0;
     place-items: center;
+    color: inherit;
     background: transparent;
     border: 1px solid transparent;
     border-radius: 8px;
@@ -547,6 +603,7 @@
 }
 
 .vc-mentions-box-emoji-unicode {
+    color: inherit;
     font-size: 32px;
     line-height: 1;
 }
@@ -578,6 +635,7 @@
 
 .vc-mentions-box-emoji-footer-unicode {
     width: 28px;
+    color: var(--white-500);
     font-size: 26px;
     line-height: 1;
     text-align: center;
@@ -585,7 +643,7 @@
 
 .vc-mentions-box-emoji-footer-name {
     overflow: hidden;
-    color: var(--text-normal);
+    color: var(--white-500);
     font-size: 14px;
     font-weight: 800;
     text-overflow: ellipsis;
@@ -1012,20 +1070,55 @@
     gap: 6px;
 }
 
-.vc-mentions-box-reply-input {
-    box-sizing: border-box;
-    width: 100%;
+.vc-mentions-box-reply-input-wrap {
+    position: relative;
     min-width: 0;
-    height: 34px;
-    min-height: 34px;
-    padding: 0 10px;
+}
+
+.vc-mentions-box-reply-rendered {
+    position: absolute;
+    inset: 1px;
+    overflow: hidden;
+    padding: 7px 10px;
     color: var(--text-normal);
     font-size: 14px;
-    line-height: 34px;
+    line-height: 20px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    pointer-events: none;
+}
+
+.vc-mentions-box-reply-rendered img {
+    width: 20px;
+    height: 20px;
+    vertical-align: -5px;
+    object-fit: contain;
+}
+
+.vc-mentions-box-reply-input {
+    box-sizing: border-box;
+    display: block;
+    width: 100%;
+    min-width: 0;
+    min-height: 34px;
+    max-height: 200px;
+    padding: 7px 10px;
+    color: var(--text-normal);
+    font-size: 14px;
+    font-family: inherit;
+    line-height: 20px;
     background: var(--background-primary, #313338);
     border: 1px solid transparent;
     border-radius: 6px;
     outline: none;
+    resize: none;
+    overflow-x: hidden;
+    overflow-y: hidden;
+}
+
+.vc-mentions-box-reply-input-rendered {
+    color: transparent;
+    caret-color: var(--text-normal);
 }
 
 .vc-mentions-box-reply-input::placeholder {
@@ -1037,20 +1130,8 @@
     background: var(--background-tertiary, #1e1f22);
 }
 
-.vc-mentions-box-reply-preview {
-    grid-column: 1 / -1;
-    min-height: 28px;
-    padding: 6px 9px;
-    color: var(--text-normal);
-    font-size: 14px;
-    line-height: 20px;
-    background: var(--background-primary, #313338);
-    border: 1px solid var(--background-modifier-accent);
-    border-radius: 6px;
-}
-
 .vc-mentions-box-reply-send {
-    align-self: stretch;
+    align-self: flex-end;
     height: 34px;
     padding: 0 12px;
     color: var(--white-500);
