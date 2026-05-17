@@ -30,7 +30,6 @@ import {
     RelationshipStore,
     RestAPI,
     SelectedChannelStore,
-    Toasts,
     useCallback,
     useEffect,
     useLayoutEffect,
@@ -372,6 +371,9 @@ let isUnreadMentionsLoadRunning = false;
 let shouldRunUnreadMentionsLoadAgain = false;
 let areNotificationsHidden = false;
 let isRecordingKeybind = false;
+let keybindToast: KeybindToastState | null = null;
+let keybindToastTimeout: ReturnType<typeof setTimeout> | null = null;
+let keybindToastId = 0;
 
 const listeners = new Set<() => void>();
 const mentionBoxReactionMessageIds = new Set<string>();
@@ -405,22 +407,31 @@ function setNotificationsHidden(isHidden: boolean) {
     emitChange();
 }
 
+interface KeybindToastState {
+    id: number;
+    message: string;
+}
+
 function showKeybindSettingToast(message: string) {
-    Toasts.show({
-        message,
-        type: Toasts.Type.MESSAGE,
-        id: Toasts.genId(),
-        options: {
-            duration: 1500,
-            position: Toasts.Position.BOTTOM
-        }
-    });
+    if (keybindToastTimeout) clearTimeout(keybindToastTimeout);
+
+    keybindToast = {
+        id: ++keybindToastId,
+        message
+    };
+    emitChange();
+
+    keybindToastTimeout = setTimeout(() => {
+        keybindToast = null;
+        keybindToastTimeout = null;
+        emitChange();
+    }, 1700);
 }
 
 function toggleNotificationsHidden(showToast = false) {
     const nextHidden = !areNotificationsHidden;
     setNotificationsHidden(nextHidden);
-    if (showToast) showKeybindSettingToast(`MentionsBox notifications ${nextHidden ? "hidden" : "shown"}`);
+    if (showToast) showKeybindSettingToast(`Mention cards ${nextHidden ? "hidden" : "shown"}`);
 }
 
 function toggleDialogueButtonMode(showToast = false) {
@@ -431,8 +442,8 @@ function toggleDialogueButtonMode(showToast = false) {
     emitChange();
     if (showToast) {
         showKeybindSettingToast(nextMode === DialogueButtonMode.Send
-            ? "Interaction buttons now send immediately"
-            : "Interaction buttons now pre-write replies"
+            ? "Interaction buttons: Send"
+            : "Interaction buttons: Draft"
         );
     }
 }
@@ -441,7 +452,7 @@ function toggleJumpToMentionOnClick(showToast = false) {
     const nextEnabled = !settings.store.jumpToMentionOnClick;
     settings.store.jumpToMentionOnClick = nextEnabled;
     emitChange();
-    if (showToast) showKeybindSettingToast(`Card click jumping ${nextEnabled ? "enabled" : "disabled"}`);
+    if (showToast) showKeybindSettingToast(`Card click jump: ${nextEnabled ? "On" : "Off"}`);
 }
 
 function setUnreadMentionsLoading(isLoading: boolean, label = unreadMentionsLoadingLabel) {
@@ -1490,6 +1501,14 @@ function useNotificationsHidden() {
     useEffect(() => subscribe(() => setIsHidden(areNotificationsHidden)), []);
 
     return isHidden;
+}
+
+function useKeybindToast() {
+    const [toast, setToast] = useState(keybindToast);
+
+    useEffect(() => subscribe(() => setToast(keybindToast)), []);
+
+    return toast;
 }
 
 function useUnreadMentionsLoading() {
@@ -2632,6 +2651,15 @@ Right-click to delete this response`}
     );
 }
 
+function KeybindToast({ toast }: { toast: KeybindToastState; }) {
+    return (
+        <div key={toast.id} className="vc-mentions-box-keybind-toast" role="status" aria-live="polite">
+            <span className="vc-mentions-box-keybind-toast-dot" aria-hidden />
+            <span>{toast.message}</span>
+        </div>
+    );
+}
+
 function MentionsBox() {
     const currentChannelId = useStateFromStores(
         [SelectedChannelStore],
@@ -2640,6 +2668,7 @@ function MentionsBox() {
     );
     const currentNotices = useNotices();
     const notificationsHidden = useNotificationsHidden();
+    const currentKeybindToast = useKeybindToast();
     const unreadMentionsLoading = useUnreadMentionsLoading();
     const { sortOrder, visibleMentions } = settings.use(["sortOrder", "visibleMentions"]);
     const visibleLimit = Math.max(1, Math.floor(Number(visibleMentions) || 5));
@@ -2654,21 +2683,25 @@ function MentionsBox() {
     const queuedCount = currentChannelId
         ? Math.max(currentNotices.length - visibleLimit, 0)
         : 0;
+    const shouldShowMentions = !notificationsHidden;
+    const shouldRenderBox = Boolean(currentKeybindToast)
+        || (shouldShowMentions && (visibleNotices.length > 0 || unreadMentionsLoading.isLoading));
 
-    if (notificationsHidden || (!visibleNotices.length && !unreadMentionsLoading.isLoading)) return null;
+    if (!shouldRenderBox) return null;
 
     return (
         <div className="vc-mentions-box" role="region" aria-label="Recent mentions">
-            {unreadMentionsLoading.isLoading && (
+            {currentKeybindToast && <KeybindToast toast={currentKeybindToast} />}
+            {shouldShowMentions && unreadMentionsLoading.isLoading && (
                 <div className="vc-mentions-box-loading" role="status" aria-live="polite">
                     <div className="vc-mentions-box-loading-bar" />
                     <span>{unreadMentionsLoading.label}</span>
                 </div>
             )}
-            {visibleNotices.map(notice => (
+            {shouldShowMentions && visibleNotices.map(notice => (
                 <MentionCard key={notice.id} notice={notice} />
             ))}
-            {queuedCount > 0 && (
+            {shouldShowMentions && queuedCount > 0 && (
                 <div className="vc-mentions-box-queued">
                     {queuedCount} more mention{queuedCount === 1 ? "" : "s"} queued
                 </div>
@@ -2745,8 +2778,11 @@ export default definePlugin({
         document.removeEventListener("keydown", globalKeydownListener, true);
         if (pruneInterval) clearInterval(pruneInterval);
         if (unreadLoadTimeout) clearTimeout(unreadLoadTimeout);
+        if (keybindToastTimeout) clearTimeout(keybindToastTimeout);
         pruneInterval = null;
         unreadLoadTimeout = null;
+        keybindToastTimeout = null;
+        keybindToast = null;
         dismissedNoticeIds.clear();
         setUnreadMentionsLoading(false);
         setNotices([]);

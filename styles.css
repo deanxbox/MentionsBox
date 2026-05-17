@@ -18,6 +18,49 @@
     display: none;
 }
 
+.vc-mentions-box-keybind-toast {
+    display: inline-flex;
+    align-self: center;
+    align-items: center;
+    gap: 8px;
+    max-width: min(420px, calc(100vw - 48px));
+    padding: 9px 12px;
+    overflow: hidden;
+    color: var(--white-500);
+    font-size: 13px;
+    font-weight: 700;
+    line-height: 18px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    background: color-mix(in oklab, var(--background-floating, #111214) 92%, transparent);
+    border: 1px solid var(--background-modifier-accent);
+    border-radius: 999px;
+    box-shadow: 0 8px 24px rgb(0 0 0 / 36%);
+    pointer-events: none;
+    animation: vc-mentions-box-keybind-toast-in 120ms ease-out;
+}
+
+.vc-mentions-box-keybind-toast-dot {
+    width: 8px;
+    height: 8px;
+    flex: 0 0 auto;
+    background: var(--brand-500, #5865f2);
+    border-radius: 50%;
+    box-shadow: 0 0 12px color-mix(in oklab, var(--brand-500, #5865f2) 70%, transparent);
+}
+
+@keyframes vc-mentions-box-keybind-toast-in {
+    from {
+        opacity: 0;
+        transform: translateY(-4px) scale(0.98);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
 .vc-mentions-box-card {
     position: relative;
     display: grid;
