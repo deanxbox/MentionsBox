@@ -41,6 +41,15 @@ import {
     useStateFromStores
 } from "@webpack/common";
 
+import { PlaceholderAutocomplete, type ReplyAutocompletePosition } from "./PlaceholderAutocomplete";
+import {
+    getReplyPlaceholderMatch,
+    getReplyPlaceholderSuggestions,
+    PLACEHOLDER_HELP,
+    type ReplyPlaceholderSuggestion,
+    resolveReplyPlaceholders
+} from "./placeholders";
+
 interface MessageCreatePayload {
     channelId: string;
     guildId?: string;
@@ -141,6 +150,7 @@ const DEFAULT_EXPIRATION_MINUTES = 10;
 const DEFAULT_STORED_MENTIONS = 50;
 const QUICK_REACTION_COUNT = 5;
 const MENTION_BOX_REACTION_SUPPRESSION_MS = 2_000;
+const PRELOAD_MESSAGE_LIMIT = 50;
 const REF_CONTENT_TRUNCATE_LENGTH = 80;
 const DEFAULT_HIDE_TOGGLE_KEYBIND = "CTRL+SHIFT+M";
 const DEFAULT_DIALOGUE_MODE_TOGGLE_KEYBIND = "CTRL+SHIFT+B";
@@ -159,26 +169,6 @@ const DEFAULT_PRESELECTED_DIALOGUES: PreselectedDialogue[] = [
     { id: "thanks", label: "Thanks", content: "Thanks for the ping, {author.name}!" },
     { id: "looking", label: "Looking now", content: "I'm looking now." },
     { id: "got-it", label: "Got it", content: "Got it — thanks." }
-];
-const PLACEHOLDER_HELP = [
-    "{server.name}",
-    "{channel.name}",
-    "{channel.id}",
-    "{message.id}",
-    "{message.link}",
-    "{message.content}",
-    "{replied-user.name}",
-    "{replied-user.username}",
-    "{replied-user.display-name}",
-    "{replied-user.id}",
-    "{author.name}",
-    "{author.username}",
-    "{author.display-name}",
-    "{author.id}",
-    "{me.name}",
-    "{me.username}",
-    "{me.display-name}",
-    "{me.id}"
 ];
 
 const EmojiUtils = findByPropsLazy("getURL", "getEmojiColors");
@@ -238,6 +228,12 @@ const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         description: "Clicking a MentionsBox card jumps to that message",
         default: true,
+        restartNeeded: false
+    },
+    preloadMentionContext: {
+        type: OptionType.BOOLEAN,
+        description: "Preload message context in the background to make jumping to mentions smoother",
+        default: false,
         restartNeeded: false
     },
     hideBotMentions: {
@@ -378,6 +374,7 @@ let keybindToastId = 0;
 const listeners = new Set<() => void>();
 const mentionBoxReactionMessageIds = new Set<string>();
 const dismissedNoticeIds = new Set<string>();
+const preloadedNoticeContexts = new Set<string>();
 let sharedInteractionSearch = "";
 
 function emitChange() {
@@ -404,6 +401,13 @@ function setNotificationsHidden(isHidden: boolean) {
     if (areNotificationsHidden === isHidden) return;
 
     areNotificationsHidden = isHidden;
+    emitChange();
+}
+
+function setSharedInteractionSearch(value: string) {
+    if (sharedInteractionSearch === value) return;
+
+    sharedInteractionSearch = value;
     emitChange();
 }
 
@@ -501,6 +505,31 @@ function removeNoticeForReply(message: MessageJSON) {
 
 function jumpToNotice(notice: MentionNotice) {
     NavigationRouter.transitionTo(`/channels/${notice.guildId ?? "@me"}/${notice.channelId}/${notice.id}`);
+}
+
+function preloadNoticeContext(notice: MentionNotice) {
+    if (!settings.store.preloadMentionContext) return;
+
+    const preloadKey = `${notice.channelId}:${notice.id}`;
+    if (preloadedNoticeContexts.has(preloadKey)) return;
+    preloadedNoticeContexts.add(preloadKey);
+
+    void RestAPI.get({
+        url: Constants.Endpoints.MESSAGES(notice.channelId),
+        query: {
+            around: notice.id,
+            limit: PRELOAD_MESSAGE_LIMIT
+        },
+        retries: 1
+    }).then(response => {
+        const messages = Array.isArray(response?.body) ? response.body : [];
+        for (const rawMessage of messages) {
+            const channelId = rawMessage.channel_id ?? rawMessage.channelId ?? notice.channelId;
+            if (channelId === notice.channelId) receiveMessage(notice.channelId, rawMessage);
+        }
+    }).catch(error => {
+        console.warn("[MentionsBox] Failed to preload mention context", error);
+    });
 }
 
 function markNoticeRead(notice: MentionNotice) {
@@ -1583,32 +1612,45 @@ function dedupeEmojis(emojis: Emoji[]) {
     });
 }
 
-function resolveInteractionReply(content: string, notice: MentionNotice) {
+function getReplyPlaceholderReplacements(notice: MentionNotice): Record<string, string> {
     const me = UserStore.getCurrentUser();
-    const meName = RelationshipStore.getNickname(me?.id) ?? (me as any)?.globalName ?? me?.username ?? "me";
+    const meNickname = me?.id ? RelationshipStore.getNickname(me.id) : null;
+    const meDisplayName = (me as any)?.globalName ?? (me as any)?.global_name ?? me?.username ?? "me";
+    const meName = meNickname ?? meDisplayName;
     const messageLink = `https://discord.com/channels/${notice.guildId ?? "@me"}/${notice.channelId}/${notice.id}`;
-    const replacements: Record<string, string> = {
+
+    return {
         "server.name": notice.guildName ?? "Direct Messages",
         "channel.name": notice.channelName,
         "channel.id": notice.channelId,
         "message.id": notice.id,
         "message.link": messageLink,
         "message.content": notice.content,
+        "reply.content": notice.referencedContent ?? "",
+        "reply.author.name": notice.referencedAuthorName ?? "",
         "replied-user.name": notice.authorName,
+        "replied-user.nickname": notice.authorName,
         "replied-user.username": notice.authorUsername,
+        "replied-user.displayname": notice.authorDisplayName,
         "replied-user.display-name": notice.authorDisplayName,
         "replied-user.id": notice.authorId,
         "author.name": notice.authorName,
+        "author.nickname": notice.authorName,
         "author.username": notice.authorUsername,
+        "author.displayname": notice.authorDisplayName,
         "author.display-name": notice.authorDisplayName,
         "author.id": notice.authorId,
         "me.name": meName,
+        "me.nickname": meNickname ?? meName,
         "me.username": me?.username ?? meName,
+        "me.displayname": meDisplayName,
         "me.display-name": meName,
         "me.id": me?.id ?? ""
     };
+}
 
-    return content.replace(/\{([^}]+)\}/g, (match, key: string) => replacements[key] ?? match);
+function resolveInteractionReply(content: string, notice: MentionNotice) {
+    return resolveReplyPlaceholders(content, getReplyPlaceholderReplacements(notice));
 }
 
 function makeEmptyDialogue(): PreselectedDialogue {
@@ -1928,19 +1970,21 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
     const [hoveredEmoji, setHoveredEmoji] = useState<Emoji | null>(null);
     const [contentOverflows, setContentOverflows] = useState(false);
     const [pickerPos, setPickerPos] = useState<{ bottom: number; right: number; } | null>(null);
+    const [autocompletePosition, setAutocompletePosition] = useState<ReplyAutocompletePosition | null>(null);
     const replyInputRef = useRef<HTMLTextAreaElement>(null);
     const emojiPickerRef = useRef<HTMLDivElement>(null);
     const pickerTriggerRef = useRef<HTMLButtonElement>(null);
     const contentRef = useRef<HTMLDivElement>(null);
+    const replyHistoryRef = useRef<Array<{ content: string; cursorPos: number; }>>([]);
     const isLong = contentOverflows || isExpanded;
     const displayContent = notice.content;
     const replyChain = notice.replyChain ?? [];
     const hasReplyPreview = replyChain.length > 0 || Boolean(notice.referencedAuthorName);
-    const { dialogueButtonMode, jumpToMentionOnClick, preselectedDialogues, persistInteractionSearch } = settings.use(["dialogueButtonMode", "jumpToMentionOnClick", "preselectedDialogues", "persistInteractionSearch"]);
+    const { dialogueButtonMode, jumpToMentionOnClick, preselectedDialogues, persistInteractionSearch, preloadMentionContext } = settings.use(["dialogueButtonMode", "jumpToMentionOnClick", "preselectedDialogues", "persistInteractionSearch", "preloadMentionContext"]);
     const setInteractionSearch = useCallback((value: string) => {
-        if (settings.store.persistInteractionSearch) sharedInteractionSearch = value;
+        if (persistInteractionSearch) setSharedInteractionSearch(value);
         setInteractionSearchRaw(value);
-    }, []);
+    }, [persistInteractionSearch]);
     const interactionReplies = (Array.isArray(preselectedDialogues) ? preselectedDialogues : DEFAULT_PRESELECTED_DIALOGUES)
         .map(normalizeDialogue)
         .filter(dialogue => dialogue.label.trim() && dialogue.content.trim())
@@ -1968,9 +2012,22 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         return { query: m[1], startIndex: text.length - m[0].length };
     }, [replyContent, cursorPos]);
 
+    const placeholderMatch = useMemo(
+        () => getReplyPlaceholderMatch(replyContent, cursorPos),
+        [replyContent, cursorPos]
+    );
+    const placeholderReplacements = useMemo(
+        () => getReplyPlaceholderReplacements(notice),
+        [notice]
+    );
+
     const autocompleteSuggestions = useMemo<Emoji[]>(
         () => emojiMatch ? searchEmojis(emojiMatch.query, notice.guildId, 8) : [],
         [emojiMatch, notice.guildId]
+    );
+    const placeholderSuggestions = useMemo(
+        () => placeholderMatch ? getReplyPlaceholderSuggestions(placeholderReplacements, placeholderMatch.query) : [],
+        [placeholderMatch, placeholderReplacements]
     );
 
     useLayoutEffect(() => {
@@ -1980,7 +2037,48 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         setContentOverflows(el.scrollWidth > el.clientWidth + 1 || el.scrollHeight > el.clientHeight + 1);
     }, [notice.content, isExpanded]);
 
-    useEffect(() => { setAutocompleteIndex(0); }, [autocompleteSuggestions.length]);
+    useEffect(() => {
+        if (preloadMentionContext) preloadNoticeContext(notice);
+    }, [notice, preloadMentionContext]);
+    useEffect(() => { setAutocompleteIndex(0); }, [autocompleteSuggestions.length, placeholderSuggestions.length]);
+    useLayoutEffect(() => {
+        const shouldShowAutocomplete = Boolean(placeholderMatch) || autocompleteSuggestions.length > 0;
+        if (!shouldShowAutocomplete) {
+            setAutocompletePosition(null);
+            return;
+        }
+
+        function updateAutocompletePosition() {
+            const input = replyInputRef.current;
+            if (!input) return;
+
+            const rect = input.getBoundingClientRect();
+            const width = Math.min(420, Math.max(320, rect.width));
+            const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8);
+
+            setAutocompletePosition({
+                left,
+                top: rect.bottom + 4,
+                width
+            });
+        }
+
+        updateAutocompletePosition();
+
+        window.addEventListener("resize", updateAutocompletePosition);
+        window.addEventListener("scroll", updateAutocompletePosition, true);
+
+        return () => {
+            window.removeEventListener("resize", updateAutocompletePosition);
+            window.removeEventListener("scroll", updateAutocompletePosition, true);
+        };
+    }, [placeholderMatch, autocompleteSuggestions.length, replyContent]);
+    useEffect(() => {
+        if (!persistInteractionSearch) return;
+
+        setInteractionSearchRaw(sharedInteractionSearch);
+        return subscribe(() => setInteractionSearchRaw(sharedInteractionSearch));
+    }, [persistInteractionSearch]);
     useEffect(() => {
         if (persistInteractionSearch) return;
         if (!isInteractionExpanded && interactionSearch) setInteractionSearch("");
@@ -2123,6 +2221,29 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         removeNotice(notice.id);
     }, [notice]);
 
+    const pushReplyHistory = useCallback(() => {
+        const history = replyHistoryRef.current;
+        const last = history.at(-1);
+        if (last?.content === replyContent && last.cursorPos === cursorPos) return;
+
+        history.push({ content: replyContent, cursorPos });
+        if (history.length > 50) history.shift();
+    }, [cursorPos, replyContent]);
+
+    const undoReplyEdit = useCallback(() => {
+        const previous = replyHistoryRef.current.pop();
+        if (!previous) return false;
+
+        setReplyContent(previous.content);
+        setCursorPos(previous.cursorPos);
+        requestAnimationFrame(() => {
+            replyInputRef.current?.focus();
+            replyInputRef.current?.setSelectionRange(previous.cursorPos, previous.cursorPos);
+        });
+
+        return true;
+    }, []);
+
     const handleReplyChange = useCallback((event: React.ChangeEvent<HTMLTextAreaElement>) => {
         const rawContent = event.currentTarget.value;
         const rawCursorPos = event.currentTarget.selectionStart ?? rawContent.length;
@@ -2142,13 +2263,14 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         event.preventDefault();
         event.stopPropagation();
 
-        const content = replyContent.trim();
+        const content = resolveInteractionReply(replyContent.trim(), notice).trim();
         if (!content || isSendingReply) return;
 
         setIsSendingReply(true);
         try {
             await sendReplyToNotice(notice, content);
             setReplyContent("");
+            replyHistoryRef.current = [];
             markNoticeRead(notice);
             removeNotice(notice.id);
             if (settings.store.jumpOnReply) jumpToNotice(notice);
@@ -2241,13 +2363,14 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
             return;
         }
 
+        pushReplyHistory();
         setReplyContent(content);
         setCursorPos(content.length);
         requestAnimationFrame(() => {
             replyInputRef.current?.focus();
             replyInputRef.current?.setSelectionRange(content.length, content.length);
         });
-    }, [dialogueButtonMode, isSendingReply, notice]);
+    }, [dialogueButtonMode, isSendingReply, notice, pushReplyHistory]);
 
     const deleteInteractionReply = useCallback((event: React.MouseEvent, id: string) => {
         event.preventDefault();
@@ -2266,20 +2389,87 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         const after = replyContent.slice(cursorPos);
         const next = before + text + after;
         const nextCursor = before.length + text.length;
+        pushReplyHistory();
         setReplyContent(next);
         setCursorPos(nextCursor);
         requestAnimationFrame(() => {
             replyInputRef.current?.focus();
             replyInputRef.current?.setSelectionRange(nextCursor, nextCursor);
         });
-    }, [replyContent, cursorPos, emojiMatch]);
+    }, [replyContent, cursorPos, emojiMatch, pushReplyHistory]);
+
+    const insertAutocompletedPlaceholder = useCallback((placeholder: ReplyPlaceholderSuggestion, mode: "value" | "token" = "value") => {
+        if (!placeholderMatch) return;
+
+        const replacement = mode === "token" ? placeholder.token : placeholder.resolvedValue;
+        const trailingBrace = replyContent[placeholderMatch.endIndex] === "}" ? 1 : 0;
+        const before = replyContent.slice(0, placeholderMatch.startIndex);
+        const after = replyContent.slice(placeholderMatch.endIndex + trailingBrace);
+        const next = before + replacement + after;
+        const nextCursor = before.length + replacement.length;
+
+        pushReplyHistory();
+        setReplyContent(next);
+        setCursorPos(nextCursor);
+        requestAnimationFrame(() => {
+            replyInputRef.current?.focus();
+            replyInputRef.current?.setSelectionRange(nextCursor, nextCursor);
+        });
+    }, [replyContent, placeholderMatch, pushReplyHistory]);
 
     const appendEmojiToReply = useCallback((emoji: Emoji) => {
+        pushReplyHistory();
         setReplyContent(prev => prev + emojiToInsertText(emoji));
         requestAnimationFrame(() => replyInputRef.current?.focus());
-    }, []);
+    }, [pushReplyHistory]);
+
+    const openPlaceholderAutocomplete = useCallback(() => {
+        const before = replyContent.slice(0, cursorPos);
+        const after = replyContent.slice(cursorPos);
+        const nextCursor = before.length + 1;
+
+        pushReplyHistory();
+        setReplyContent(`${before}{${after}`);
+        setCursorPos(nextCursor);
+        requestAnimationFrame(() => {
+            replyInputRef.current?.focus();
+            replyInputRef.current?.setSelectionRange(nextCursor, nextCursor);
+        });
+    }, [cursorPos, pushReplyHistory, replyContent]);
 
     const handleReplyKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z" && !event.shiftKey && undoReplyEdit()) {
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+        }
+
+        if (placeholderMatch) {
+            if (event.key === "ArrowDown") {
+                event.preventDefault();
+                if (placeholderSuggestions.length) setAutocompleteIndex(i => (i + 1) % placeholderSuggestions.length);
+                return;
+            }
+
+            if (event.key === "ArrowUp") {
+                event.preventDefault();
+                if (placeholderSuggestions.length) setAutocompleteIndex(i => (i - 1 + placeholderSuggestions.length) % placeholderSuggestions.length);
+                return;
+            }
+
+            if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) {
+                event.preventDefault();
+                event.stopPropagation();
+                if (placeholderSuggestions.length) {
+                    insertAutocompletedPlaceholder(
+                        placeholderSuggestions[autocompleteIndex] ?? placeholderSuggestions[0],
+                        event.shiftKey ? "token" : "value"
+                    );
+                }
+                return;
+            }
+        }
+
         if (autocompleteSuggestions.length) {
             if (event.key === "ArrowDown") {
                 event.preventDefault();
@@ -2296,9 +2486,16 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
             if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) {
                 event.preventDefault();
                 event.stopPropagation();
-                insertAutocompletedEmoji(autocompleteSuggestions[autocompleteIndex]);
+                insertAutocompletedEmoji(autocompleteSuggestions[autocompleteIndex] ?? autocompleteSuggestions[0]);
                 return;
             }
+        }
+
+        if (event.key === "Tab") {
+            event.preventDefault();
+            event.stopPropagation();
+            openPlaceholderAutocomplete();
+            return;
         }
 
         if (event.key === "Enter" && !event.shiftKey) {
@@ -2306,7 +2503,7 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
             event.stopPropagation();
             event.currentTarget.form?.requestSubmit();
         }
-    }, [autocompleteSuggestions, autocompleteIndex, insertAutocompletedEmoji]);
+    }, [placeholderMatch, placeholderSuggestions, autocompleteSuggestions, autocompleteIndex, insertAutocompletedPlaceholder, insertAutocompletedEmoji, openPlaceholderAutocomplete, undoReplyEdit]);
 
     const handleCardBlurCapture = useCallback((event: React.FocusEvent<HTMLDivElement>) => {
         const nextTarget = event.relatedTarget;
@@ -2595,8 +2792,25 @@ Right-click to delete this response`}
                     </div>
                 </div>
                 <form className="vc-mentions-box-reply" onSubmit={submitReply} onClick={event => event.stopPropagation()}>
-                    {autocompleteSuggestions.length > 0 && (
-                        <div className="vc-mentions-box-autocomplete">
+                    {placeholderMatch && (
+                        <PlaceholderAutocomplete
+                            position={autocompletePosition}
+                            query={placeholderMatch.query}
+                            suggestions={placeholderSuggestions}
+                            selectedIndex={autocompleteIndex}
+                            onHover={setAutocompleteIndex}
+                            onSelect={insertAutocompletedPlaceholder}
+                        />
+                    )}
+                    {!placeholderMatch && autocompletePosition && autocompleteSuggestions.length > 0 && ReactDOM.createPortal(
+                        <div
+                            className="vc-mentions-box-autocomplete"
+                            style={{
+                                left: autocompletePosition.left,
+                                top: autocompletePosition.top,
+                                width: autocompletePosition.width
+                            }}
+                        >
                             {autocompleteSuggestions.map((emoji, idx) => {
                                 const imgUrl = getEmojiImageUrl(emoji);
                                 return (
@@ -2618,7 +2832,8 @@ Right-click to delete this response`}
                                     </button>
                                 );
                             })}
-                        </div>
+                        </div>,
+                        document.body
                     )}
                     <div className="vc-mentions-box-reply-input-wrap">
                         {replyContent && (
@@ -2784,6 +2999,7 @@ export default definePlugin({
         keybindToastTimeout = null;
         keybindToast = null;
         dismissedNoticeIds.clear();
+        preloadedNoticeContexts.clear();
         setUnreadMentionsLoading(false);
         setNotices([]);
         unmountRoot();
@@ -2829,10 +3045,15 @@ export default definePlugin({
             if (!message?.id || message.state === "SENDING" || !isRelevantMention(message)) return;
 
             const notice = buildNoticeFromMessage(message, channelId, guildId);
-            if (notice) addNotice({
-                ...notice,
-                timestamp: Date.now()
-            });
+            if (notice) {
+                const nextNotice = {
+                    ...notice,
+                    timestamp: Date.now()
+                };
+
+                addNotice(nextNotice);
+                preloadNoticeContext(nextNotice);
+            }
         },
 
         MESSAGE_REACTION_ADD(payload: MessageReactionPayload) {
