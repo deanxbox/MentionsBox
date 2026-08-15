@@ -5,6 +5,9 @@ MentionsBox is a simple Vencord user plugin that shows recent mentions in a clea
 ## Features
 
 - Shows a top-screen notification when someone mentions you.
+- Can instead appear as a button above the server/channel section, opening a scrollable MentionsBox manager.
+- The manager can search and filter mentions, reverse their order, select individual cards, refresh unread mentions, and clear selected or all cards.
+- After replying to or dismissing a managed card, focus advances to the next visible mention.
 - Works across servers, DMs, and group DMs.
 - Shows the server and channel for server mentions.
 - Click a notification to jump directly to the mentioned message.
@@ -27,6 +30,7 @@ MentionsBox is a simple Vencord user plugin that shows recent mentions in a clea
 
 MentionsBox adds several settings to the Vencord plugin settings page:
 
+- `displayLocation`: choose between the existing top-screen notification stack and the channels-section button.
 - `visibleMentions`: choose how many recent mentions to show at once.
 - `storedMentions`: enter how many recent mentions to keep in the queue.
 - `sortOrder`: choose whether the notification stack shows newest mentions first or oldest mentions first.

@@ -19,7 +19,6 @@ interface PlaceholderAutocompleteProps {
     query: string;
     suggestions: ReplyPlaceholderSuggestion[];
     selectedIndex: number;
-    onHover(index: number): void;
     onSelect(placeholder: ReplyPlaceholderSuggestion, mode: "value" | "token"): void;
 }
 
@@ -28,7 +27,6 @@ export function PlaceholderAutocomplete({
     query,
     suggestions,
     selectedIndex,
-    onHover,
     onSelect
 }: PlaceholderAutocompleteProps) {
     const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -58,7 +56,6 @@ export function PlaceholderAutocomplete({
                             }}
                             type="button"
                             className={`vc-mentions-box-autocomplete-item vc-mentions-box-placeholder-item${idx === selectedIndex ? " vc-mentions-box-autocomplete-item--active" : ""}`}
-                            onMouseEnter={() => onHover(idx)}
                             onMouseDown={e => {
                                 e.preventDefault();
                                 onSelect(placeholder, e.shiftKey ? "token" : "value");

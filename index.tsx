@@ -6,30 +6,36 @@
 
 import "./styles.css";
 
+import { DataStore } from "@api/index";
+import { addServerListElement, removeServerListElement, ServerListRenderPosition } from "@api/ServerList";
 import { definePluginSettings } from "@api/Settings";
 import ErrorBoundary from "@components/ErrorBoundary";
-import { openMediaModal } from "@utils/modal";
 import definePlugin, { OptionType, type PluginAuthor } from "@utils/types";
-import type { Emoji, MessageJSON } from "@vencord/discord-types";
-import { ChannelType } from "@vencord/discord-types/enums";
-import { findByPropsLazy } from "@webpack";
+import type { CloudUpload as TCloudUpload, Emoji, MessageJSON, RenderModalProps, Sticker } from "@vencord/discord-types";
+import { ChannelType, CloudUploadPlatform, MessageType, StickerFormatType } from "@vencord/discord-types/enums";
+import { findByPropsLazy, findLazy } from "@webpack";
 import {
     ChannelStore,
     Constants,
     createRoot,
     EmojiStore,
     FluxDispatcher,
+    GuildMemberStore,
     GuildStore,
     IconUtils,
     Menu,
     MessageStore,
+    Modal,
     NavigationRouter,
+    openMediaModal,
+    openModal,
     Parser,
     ReactDOM,
     ReadStateStore,
     RelationshipStore,
     RestAPI,
     SelectedChannelStore,
+    StickersStore,
     useCallback,
     useEffect,
     useLayoutEffect,
@@ -41,11 +47,13 @@ import {
     useStateFromStores
 } from "@webpack/common";
 
+import { filterAndSortNotices, getNextNoticeId, type MentionFilter } from "./manager";
 import { PlaceholderAutocomplete, type ReplyAutocompletePosition } from "./PlaceholderAutocomplete";
 import {
     getReplyPlaceholderMatch,
     getReplyPlaceholderSuggestions,
     PLACEHOLDER_HELP,
+    REPLY_PLACEHOLDERS,
     type ReplyPlaceholderSuggestion,
     resolveReplyPlaceholders
 } from "./placeholders";
@@ -59,10 +67,17 @@ interface MessageCreatePayload {
 interface MessageReactionPayload {
     channelId?: string;
     channel_id?: string;
+    guildId?: string;
+    guild_id?: string;
     messageId?: string;
     message_id?: string;
     userId?: string;
     user_id?: string;
+    emoji?: {
+        id?: string | null;
+        name?: string;
+        animated?: boolean;
+    };
 }
 
 interface ReplyPreview {
@@ -96,6 +111,21 @@ interface StoredReaction {
     };
 }
 
+interface TypingStartPayload {
+    channelId?: string;
+    channel_id?: string;
+    userId?: string;
+    user_id?: string;
+}
+
+type SelectedReplySticker = {
+    id: string;
+    name: string;
+    formatType: StickerFormatType;
+} | null;
+
+type MentionNoticeKind = "reaction" | "reply-to-mention" | "typing";
+
 interface MentionNotice {
     id: string;
     channelId: string;
@@ -116,8 +146,16 @@ interface MentionNotice {
     reactedEmojiKeys: string[];
     reactions: StoredReaction[];
     timestamp: number;
+    kind?: MentionNoticeKind;
+    deleted?: boolean;
     externalReactionDismissStartedAt?: number;
     externalReactionDismissDurationMs?: number;
+}
+
+interface MentionSourceOption {
+    value: string;
+    label: string;
+    count: number;
 }
 
 interface PreselectedDialogue {
@@ -144,18 +182,23 @@ const Dean: PluginAuthor = {
 
 const ROOT_ID = "vc-mentions-box-root";
 const RECENT_MENTIONS_ENDPOINT = "/users/@me/mentions";
+const KEYWORD_NOTIFIER_LOG_KEY = "KeywordNotify_log";
 const RECENT_MENTIONS_PAGE_LIMIT = 100;
 const RECENT_MENTIONS_MAX_PAGES = 10;
 const DEFAULT_EXPIRATION_MINUTES = 10;
 const DEFAULT_STORED_MENTIONS = 50;
+const SLOWMODE_REPLY_RETRY_DELAY_MS = 1_000;
 const QUICK_REACTION_COUNT = 5;
 const MENTION_BOX_REACTION_SUPPRESSION_MS = 2_000;
 const PRELOAD_MESSAGE_LIMIT = 50;
 const REF_CONTENT_TRUNCATE_LENGTH = 80;
 const DEFAULT_HIDE_TOGGLE_KEYBIND = "CTRL+SHIFT+M";
 const DEFAULT_DIALOGUE_MODE_TOGGLE_KEYBIND = "CTRL+SHIFT+B";
-const DEFAULT_JUMP_TOGGLE_KEYBIND = "CTRL+SHIFT+J";
+const DEFAULT_JUMP_ON_REPLY_TOGGLE_KEYBIND = "F3";
+const DEFAULT_SOURCE_FILTER_TOGGLE_KEYBIND = "F4";
+const DEFAULT_REPLY_CHAIN_TOGGLE_KEYBIND = "CTRL+SHIFT+Y";
 const DEFAULT_EXTERNAL_REACTION_DISMISS_SECONDS = 8;
+const DEFAULT_PLACEHOLDER_ORDER = REPLY_PLACEHOLDERS.map(placeholder => placeholder.key);
 const THREAD_CHANNEL_TYPES = new Set([10, 11, 12]);
 const IMAGE_EXTENSIONS = /\.(?:png|jpe?g|webp|gif|avif)(?:[?#].*)?$/i;
 const VIDEO_EXTENSIONS = /\.(?:mp4|webm|mov)(?:[?#].*)?$/i;
@@ -172,10 +215,16 @@ const DEFAULT_PRESELECTED_DIALOGUES: PreselectedDialogue[] = [
 ];
 
 const EmojiUtils = findByPropsLazy("getURL", "getEmojiColors");
+const CloudUpload: typeof TCloudUpload = findLazy(module => module.prototype?.trackUploadFinished);
 
 const enum SortOrder {
     Newest = "newest",
     Oldest = "oldest"
+}
+
+const enum DisplayLocation {
+    Top = "top",
+    Channels = "channels"
 }
 
 const enum DialogueButtonMode {
@@ -184,6 +233,16 @@ const enum DialogueButtonMode {
 }
 
 const settings = definePluginSettings({
+    displayLocation: {
+        type: OptionType.SELECT,
+        description: "Where MentionsBox appears",
+        options: [
+            { label: "Appear at top", value: DisplayLocation.Top, default: true },
+            { label: "Appear in channels section", value: DisplayLocation.Channels }
+        ],
+        restartNeeded: false,
+        onChange: applyDisplayLocation
+    },
     visibleMentions: {
         type: OptionType.SLIDER,
         description: "How many recent mention notifications to show at once",
@@ -236,6 +295,36 @@ const settings = definePluginSettings({
         default: false,
         restartNeeded: false
     },
+    showReactionMentions: {
+        type: OptionType.BOOLEAN,
+        description: "Show a MentionsBox card when someone reacts to one of your messages",
+        default: true,
+        restartNeeded: false
+    },
+    showDmTypingMentions: {
+        type: OptionType.BOOLEAN,
+        description: "Show a MentionsBox card when someone starts typing in your DMs",
+        default: false,
+        restartNeeded: false
+    },
+    showRepliesToMentionedMessages: {
+        type: OptionType.BOOLEAN,
+        description: "Show a MentionsBox card when someone replies to a message that mentions you",
+        default: false,
+        restartNeeded: false
+    },
+    autoViewReplyChain: {
+        type: OptionType.BOOLEAN,
+        description: "Automatically expand reply chains on MentionsBox cards",
+        default: false,
+        restartNeeded: false
+    },
+    autoExpandReadMore: {
+        type: OptionType.BOOLEAN,
+        description: "Automatically expand long messages on MentionsBox cards",
+        default: false,
+        restartNeeded: false
+    },
     hideBotMentions: {
         type: OptionType.BOOLEAN,
         description: "Hide mentions from bot users",
@@ -243,6 +332,15 @@ const settings = definePluginSettings({
         restartNeeded: false,
         onChange(isEnabled: boolean) {
             if (isEnabled) setNotices(notices.filter(notice => !isBotNotice(notice)));
+        }
+    },
+    autoReadBotMentions: {
+        type: OptionType.BOOLEAN,
+        description: "Automatically mark bot mentions as read and hide them from MentionsBox",
+        default: false,
+        restartNeeded: false,
+        onChange(isEnabled: boolean) {
+            if (isEnabled) removeNotices(notices.filter(isBotNotice));
         }
     },
     hideDmMentions: {
@@ -270,11 +368,27 @@ const settings = definePluginSettings({
         hidden: true,
         restartNeeded: false
     },
-    jumpToggleKeybind: {
+    jumpOnReplyToggleKeybind: {
         type: OptionType.STRING,
-        description: "Keybind to toggle clicking MentionsBox cards to jump to messages. Leave empty to disable.",
-        default: DEFAULT_JUMP_TOGGLE_KEYBIND,
-        placeholder: DEFAULT_JUMP_TOGGLE_KEYBIND,
+        description: "Keybind to toggle jumping to a mention after replying. Leave empty to disable.",
+        default: DEFAULT_JUMP_ON_REPLY_TOGGLE_KEYBIND,
+        placeholder: DEFAULT_JUMP_ON_REPLY_TOGGLE_KEYBIND,
+        hidden: true,
+        restartNeeded: false
+    },
+    sourceFilterToggleKeybind: {
+        type: OptionType.STRING,
+        description: "Keybind to show or hide the server and DM filter. Leave empty to disable.",
+        default: DEFAULT_SOURCE_FILTER_TOGGLE_KEYBIND,
+        placeholder: DEFAULT_SOURCE_FILTER_TOGGLE_KEYBIND,
+        hidden: true,
+        restartNeeded: false
+    },
+    replyChainToggleKeybind: {
+        type: OptionType.STRING,
+        description: "Keybind to toggle the focused MentionsBox reply chain. Leave empty to disable.",
+        default: DEFAULT_REPLY_CHAIN_TOGGLE_KEYBIND,
+        placeholder: DEFAULT_REPLY_CHAIN_TOGGLE_KEYBIND,
         hidden: true,
         restartNeeded: false
     },
@@ -306,6 +420,17 @@ const settings = definePluginSettings({
     preselectedDialogues: {
         type: OptionType.CUSTOM,
         default: DEFAULT_PRESELECTED_DIALOGUES
+    },
+    placeholderOrderSettings: {
+        type: OptionType.COMPONENT,
+        description: "Manage tab placeholder autocomplete order",
+        component: PlaceholderOrderSettings,
+        restartNeeded: false
+    },
+    placeholderOrder: {
+        type: OptionType.CUSTOM,
+        default: DEFAULT_PLACEHOLDER_ORDER,
+        restartNeeded: false
     },
     externalReactionDismissSeconds: {
         type: OptionType.NUMBER,
@@ -358,6 +483,7 @@ const settings = definePluginSettings({
 });
 
 let root: ReturnType<typeof createRoot> | null = null;
+let pluginStarted = false;
 let notices: MentionNotice[] = [];
 let pruneInterval: ReturnType<typeof setInterval> | null = null;
 let unreadLoadTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -366,15 +492,57 @@ let unreadMentionsLoadingLabel = "Loading unread mentions…";
 let isUnreadMentionsLoadRunning = false;
 let shouldRunUnreadMentionsLoadAgain = false;
 let areNotificationsHidden = false;
+let isSourceFilterVisible = false;
 let isRecordingKeybind = false;
 let keybindToast: KeybindToastState | null = null;
 let keybindToastTimeout: ReturnType<typeof setTimeout> | null = null;
 let keybindToastId = 0;
+let keywordNotifierMentionIds = new Set<string>();
+
+function getPlaceholderOrder(rawOrder = settings.store.placeholderOrder) {
+    const validKeys = new Set(REPLY_PLACEHOLDERS.map(placeholder => placeholder.key));
+    const seen = new Set<string>();
+    const keys = Array.isArray(rawOrder)
+        ? rawOrder
+        : String(rawOrder ?? DEFAULT_PLACEHOLDER_ORDER.join(",")).split(/[\s,]+/);
+
+    return keys
+        .map(key => key.trim())
+        .filter(key => validKeys.has(key) && !seen.has(key) && Boolean(seen.add(key)));
+}
+
+function parseKeywordNotifierLogEntry(entry: any) {
+    if (!entry) return null;
+    if (typeof entry !== "string") return entry;
+
+    try {
+        return JSON.parse(entry);
+    } catch {
+        return null;
+    }
+}
+
+async function getKeywordNotifierMessages() {
+    const log = await DataStore.get(KEYWORD_NOTIFIER_LOG_KEY).catch(() => []);
+    return (Array.isArray(log) ? log : [])
+        .map(parseKeywordNotifierLogEntry)
+        .filter(Boolean);
+}
+
+async function refreshKeywordNotifierMentionIds() {
+    keywordNotifierMentionIds = new Set(
+        (await getKeywordNotifierMessages())
+            .map(message => message.id ?? message.message_id ?? message.messageId)
+            .filter(Boolean)
+    );
+}
 
 const listeners = new Set<() => void>();
 const mentionBoxReactionMessageIds = new Set<string>();
 const dismissedNoticeIds = new Set<string>();
 const preloadedNoticeContexts = new Set<string>();
+const pendingReplyNoticeRemovalIds = new Set<string>();
+const sentReplyChains = new Map<string, ReplyPreview[]>();
 let sharedInteractionSearch = "";
 
 function emitChange() {
@@ -473,13 +641,39 @@ function sortNoticesNewestFirst(nextNotices: MentionNotice[]) {
 
 function removeNotice(id: string) {
     dismissedNoticeIds.add(id);
+    pendingReplyNoticeRemovalIds.delete(id);
     setNotices(notices.filter(notice => notice.id !== id));
+}
+
+function toggleSourceFilter() {
+    isSourceFilterVisible = !isSourceFilterVisible;
+    emitChange();
+}
+
+function toggleJumpOnReply(showToast = false) {
+    const nextEnabled = !settings.store.jumpOnReply;
+    settings.store.jumpOnReply = nextEnabled;
+    emitChange();
+    if (showToast) showKeybindSettingToast(`Jump on reply: ${nextEnabled ? "On" : "Off"}`);
+}
+
+function removeNotices(noticesToRemove: readonly MentionNotice[]) {
+    if (!noticesToRemove.length) return;
+
+    const ids = new Set(noticesToRemove.map(notice => notice.id));
+    noticesToRemove.forEach(notice => {
+        dismissedNoticeIds.add(notice.id);
+        pendingReplyNoticeRemovalIds.delete(notice.id);
+        markNoticeRead(notice);
+    });
+    setNotices(notices.filter(notice => !ids.has(notice.id)));
 }
 
 function removeNoticeForMessage(messageId?: string, channelId?: string, shouldMarkRead = false) {
     if (!messageId) return false;
 
     dismissedNoticeIds.add(messageId);
+    pendingReplyNoticeRemovalIds.delete(messageId);
 
     if (shouldMarkRead) {
         for (const notice of notices) {
@@ -499,11 +693,60 @@ function removeNoticeForMessage(messageId?: string, channelId?: string, shouldMa
 
 function removeNoticeForReply(message: MessageJSON) {
     const reference = message.message_reference;
+    const messageId = reference?.message_id;
+    if (messageId && pendingReplyNoticeRemovalIds.has(messageId)) {
+        for (const notice of notices) {
+            if (notice.id === messageId && (!reference?.channel_id || notice.channelId === reference.channel_id)) markNoticeRead(notice);
+        }
+        return true;
+    }
 
-    return removeNoticeForMessage(reference?.message_id, reference?.channel_id, true);
+    return removeNoticeForMessage(messageId, reference?.channel_id, true);
+}
+
+function markNoticeDeleted(messageId?: string, channelId?: string) {
+    if (!messageId) return false;
+
+    let changed = false;
+    const nextNotices = notices.map(notice => {
+        const matches = notice.id === messageId && (!channelId || notice.channelId === channelId);
+        if (!matches || notice.deleted) return notice;
+
+        changed = true;
+        return {
+            ...notice,
+            deleted: true
+        };
+    });
+
+    if (!changed) return false;
+    setNotices(nextNotices);
+    return true;
+}
+
+function getDeletedMessageIds(payload: any): string[] {
+    const directId = payload?.id ?? payload?.messageId ?? payload?.message_id;
+    if (directId) return [directId];
+
+    const ids = payload?.ids ?? payload?.messageIds ?? payload?.message_ids;
+    if (Array.isArray(ids)) return ids.filter(Boolean);
+
+    const messages = payload?.messages;
+    if (Array.isArray(messages)) {
+        return messages
+            .map(message => message?.id ?? message?.messageId ?? message?.message_id)
+            .filter(Boolean);
+    }
+
+    return [];
 }
 
 function jumpToNotice(notice: MentionNotice) {
+    if (notice.kind === "typing") {
+        NavigationRouter.transitionTo(`/channels/@me/${notice.channelId}`);
+        return;
+    }
+
     NavigationRouter.transitionTo(`/channels/${notice.guildId ?? "@me"}/${notice.channelId}/${notice.id}`);
 }
 
@@ -532,16 +775,23 @@ function preloadNoticeContext(notice: MentionNotice) {
     });
 }
 
-function markNoticeRead(notice: MentionNotice) {
+function markMessageRead(channelId?: string, messageId?: string) {
+    if (!channelId || !messageId) return;
+
     FluxDispatcher.dispatch({
         type: "BULK_ACK",
         context: "APP",
         channels: [{
-            channelId: notice.channelId,
-            messageId: notice.id,
+            channelId,
+            messageId,
             readStateType: 0
         }]
     });
+}
+
+function markNoticeRead(notice: MentionNotice) {
+    if (notice.kind === "typing") return;
+    markMessageRead(notice.channelId, notice.id);
 }
 
 function compareSnowflakeIds(a?: string | null, b?: string | null) {
@@ -572,6 +822,7 @@ function formatSentTime(timestamp: number) {
     return new Intl.DateTimeFormat(undefined, {
         hour: "numeric",
         minute: "2-digit",
+        second: "2-digit",
         day: "numeric",
         month: "short"
     }).format(new Date(timestamp));
@@ -583,6 +834,10 @@ function getReactionPayloadMessageId(payload: MessageReactionPayload) {
 
 function getReactionPayloadChannelId(payload: MessageReactionPayload) {
     return payload.channelId ?? payload.channel_id;
+}
+
+function getReactionPayloadGuildId(payload: MessageReactionPayload) {
+    return payload.guildId ?? payload.guild_id;
 }
 
 function getReactionPayloadUserId(payload: MessageReactionPayload) {
@@ -794,8 +1049,17 @@ function syncUnreadNotices(unreadNotices: MentionNotice[]) {
 
         const existingNotice = existingById.get(notice.id);
         const pendingDismissNotice = pendingExternalDismisses.get(notice.id);
+        const replyChain = existingNotice && existingNotice.replyChain.length > notice.replyChain.length
+            ? existingNotice.replyChain
+            : notice.replyChain;
+        const immediateReply = replyChain.at(-1);
         const mergedNotice = {
             ...notice,
+            replyChain,
+            ...(immediateReply ? {
+                referencedContent: immediateReply.content,
+                referencedAuthorName: immediateReply.authorName
+            } : {}),
             reactedEmojiKeys: existingNotice?.reactedEmojiKeys ?? notice.reactedEmojiKeys,
             reactions: existingNotice?.reactions ?? notice.reactions
         };
@@ -860,21 +1124,7 @@ function getChannelName(channel: any) {
 }
 
 function formatContent(message: MessageJSON | any) {
-    let content = message.content?.trim() || "";
-    const { mentions } = message;
-    const mentionUsers: any[] = Array.isArray(mentions)
-        ? mentions
-        : mentions instanceof Set
-            ? [...mentions]
-            : [];
-
-    for (const user of mentionUsers) {
-        if (typeof user === "string") continue;
-        const displayName = RelationshipStore.getNickname(user.id) ?? (user as any).globalName ?? (user as any).global_name ?? user.username;
-        if (displayName) content = content.replace(new RegExp(`<@!?${user.id}>`, "g"), `@${displayName}`);
-    }
-
-    return content || "Mentioned you";
+    return message.content?.trim() || "Mentioned you";
 }
 
 function getMessageReference(message: any) {
@@ -895,14 +1145,81 @@ function getAttachmentOriginalUrl(attachment: any) {
 
 function getStickerMediaUrl(sticker: any, size = 160) {
     const id = sticker?.id;
-    const formatType = sticker?.format_type ?? sticker?.formatType;
+    const formatType = getStickerFormatType(sticker);
     const ext = STICKER_FORMAT_EXTENSIONS[formatType] ?? "png";
     if (!id || ext === "json") return null;
 
     return `${window.GLOBAL_ENV.MEDIA_PROXY_ENDPOINT}/stickers/${id}.${ext}?size=${size}&lossless=true&animated=true`;
 }
 
-function collectMessageMedia(message: any): MessageMediaPreview[] {
+function getStickerFormatType(sticker: any): StickerFormatType {
+    return (sticker?.format_type
+        ?? sticker?.formatType
+        ?? (sticker?.id ? StickersStore.getStickerById(sticker.id)?.format_type : undefined)
+        ?? StickerFormatType.PNG) as StickerFormatType;
+}
+
+function isPreviewableSticker(sticker: any) {
+    return Boolean(sticker?.id) && getStickerFormatType(sticker) !== StickerFormatType.LOTTIE && Boolean(getStickerMediaUrl(sticker, 96));
+}
+
+function getStickerName(sticker: any) {
+    return sticker?.name ?? "Sticker";
+}
+
+function getStickerSearchText(sticker: any) {
+    return [
+        sticker?.name,
+        sticker?.description,
+        sticker?.tags
+    ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+}
+
+function matchesStickerSearch(sticker: any, query: string) {
+    const q = query.trim().toLowerCase();
+    if (!q) return true;
+
+    const searchText = getStickerSearchText(sticker);
+    return q.split(/\s+/).every(part => searchText.includes(part));
+}
+
+function getDefaultReplyStickers(): Sticker[] {
+    const byId = new Map<string, Sticker>();
+
+    StickersStore.getPremiumPacks?.()?.forEach(pack => {
+        pack.stickers?.forEach(sticker => {
+            if (isPreviewableSticker(sticker)) byId.set(sticker.id, sticker);
+        });
+    });
+
+    StickersStore.getAllPackStickers?.()?.forEach(stickers => {
+        stickers.forEach(sticker => {
+            if (isPreviewableSticker(sticker)) byId.set(sticker.id, sticker);
+        });
+    });
+
+    return [...byId.values()];
+}
+
+async function fetchDefaultReplyStickerPacks() {
+    const response = await RestAPI.get({ url: "/sticker-packs" });
+    const packs = response.body?.sticker_packs ?? response.body?.stickerPacks ?? response.body ?? [];
+    if (!Array.isArray(packs)) return [];
+
+    const byId = new Map<string, Sticker>();
+    for (const pack of packs) {
+        for (const sticker of pack.stickers ?? []) {
+            if (isPreviewableSticker(sticker)) byId.set(sticker.id, sticker);
+        }
+    }
+
+    return [...byId.values()];
+}
+
+function collectMessageMedia(...messages: any[]): MessageMediaPreview[] {
     const media: MessageMediaPreview[] = [];
     const seen = new Set<string>();
 
@@ -912,7 +1229,7 @@ function collectMessageMedia(message: any): MessageMediaPreview[] {
         media.push(item);
     }
 
-    for (const attachment of message?.attachments ?? []) {
+    for (const attachment of messages.flatMap(message => message?.attachments ?? [])) {
         const url = getAttachmentUrl(attachment);
         const originalUrl = getAttachmentOriginalUrl(attachment);
         const contentType = getAttachmentContentType(attachment);
@@ -946,39 +1263,58 @@ function collectMessageMedia(message: any): MessageMediaPreview[] {
         }
     }
 
-    for (const embed of message?.embeds ?? []) {
-        const image = embed.image ?? embed.thumbnail;
+    for (const embed of messages.flatMap(message => message?.embeds ?? [])) {
+        const images = embed.images?.length ? embed.images : [embed.image ?? embed.thumbnail].filter(Boolean);
         const { video } = embed;
-        const imageUrl = image?.proxy_url ?? image?.proxyURL ?? image?.url;
         const videoUrl = video?.proxy_url ?? video?.proxyURL ?? video?.url;
         const { type } = embed;
 
-        if (imageUrl) {
-            addMedia({
-                id: imageUrl,
-                kind: type === "gifv" ? "gif" : "image",
-                url: imageUrl,
-                originalUrl: image?.url ?? embed.url ?? imageUrl,
-                label: type === "gifv" ? "GIF" : "Embed",
-                width: image?.width,
-                height: image?.height,
-                animated: type === "gifv"
-            });
-        } else if (videoUrl) {
+        if (type === "gifv" && videoUrl) {
             addMedia({
                 id: videoUrl,
-                kind: type === "gifv" ? "gif" : "video",
+                kind: "video",
                 url: videoUrl,
                 originalUrl: embed.url ?? videoUrl,
-                label: type === "gifv" ? "GIF" : "Video",
+                label: "GIF",
                 width: video?.width,
                 height: video?.height,
-                animated: type === "gifv"
+                animated: true
+            });
+            continue;
+        }
+
+        for (const image of images) {
+            const imageUrl = image?.proxy_url ?? image?.proxyURL ?? image?.url;
+            if (!imageUrl) continue;
+
+            addMedia({
+                id: imageUrl,
+                kind: "image",
+                url: imageUrl,
+                originalUrl: image?.url ?? embed.url ?? imageUrl,
+                label: "Embed",
+                width: image?.width,
+                height: image?.height
+            });
+        }
+
+        if (!images.length && videoUrl) {
+            addMedia({
+                id: videoUrl,
+                kind: "video",
+                url: videoUrl,
+                originalUrl: embed.url ?? videoUrl,
+                label: "Video",
+                width: video?.width,
+                height: video?.height
             });
         }
     }
 
-    for (const sticker of [...(message?.stickerItems ?? message?.sticker_items ?? []), ...(message?.stickers ?? [])]) {
+    for (const sticker of messages.flatMap(message => [
+        ...(message?.stickerItems ?? message?.sticker_items ?? []),
+        ...(message?.stickers ?? [])
+    ])) {
         const url = getStickerMediaUrl(sticker);
         if (!url) continue;
 
@@ -991,11 +1327,29 @@ function collectMessageMedia(message: any): MessageMediaPreview[] {
             label: "Sticker",
             width: 160,
             height: 160,
-            animated: (sticker.format_type ?? sticker.formatType) === 4
+            animated: getStickerFormatType(sticker) === StickerFormatType.GIF
         });
     }
 
     return media;
+}
+
+function updateNoticeMedia(message: any, fallbackChannelId?: string) {
+    const messageId = message?.id ?? message?.message_id ?? message?.messageId;
+    const channelId = message?.channel_id ?? message?.channelId ?? fallbackChannelId;
+    if (!messageId || !channelId || !notices.some(notice => notice.id === messageId && notice.channelId === channelId)) return;
+
+    const freshMedia = collectMessageMedia(message, MessageStore.getMessage(channelId, messageId));
+    if (!freshMedia.length) return;
+
+    setNotices(notices.map(notice => {
+        if (notice.id !== messageId || notice.channelId !== channelId) return notice;
+
+        const media = [...notice.media, ...freshMedia].filter((item, index, items) =>
+            items.findIndex(candidate => candidate.url === item.url) === index
+        );
+        return { ...notice, media };
+    }));
 }
 
 function renderMessageContent(content: string, channelId?: string, messageId?: string) {
@@ -1046,7 +1400,15 @@ function MessageMedia({ media, compact = false }: { media: MessageMediaPreview[]
                     title={`Open ${item.filename ?? item.label}`}
                 >
                     {item.kind === "video" ? (
-                        <video className="vc-mentions-box-media-img" src={item.url} muted preload="metadata" />
+                        <video
+                            className="vc-mentions-box-media-img"
+                            src={item.url}
+                            muted
+                            preload="metadata"
+                            autoPlay={item.label === "GIF"}
+                            loop={item.label === "GIF"}
+                            playsInline
+                        />
                     ) : (
                         <img className="vc-mentions-box-media-img" src={item.url} alt={item.filename ?? item.label} />
                     )}
@@ -1057,9 +1419,140 @@ function MessageMedia({ media, compact = false }: { media: MessageMediaPreview[]
     );
 }
 
+function StickerPickerTab({ active, onClick, children }: { active: boolean; onClick(): void; children: React.ReactNode; }) {
+    return (
+        <button
+            type="button"
+            className={`vc-mentions-box-sticker-tab${active ? " vc-mentions-box-sticker-tab-active" : ""}`}
+            onClick={onClick}
+            title={typeof children === "string" ? children : undefined}
+        >
+            {children}
+        </button>
+    );
+}
+
+function MentionStickerPicker({ selectedId, onSelect, closePopout }: { selectedId: string | null; onSelect(sticker: SelectedReplySticker): void; closePopout(): void; }) {
+    const [search, setSearch] = useState("");
+    const [selectedGroupId, setSelectedGroupId] = useState("default");
+    const [loadedDefaultStickers, setLoadedDefaultStickers] = useState<Sticker[]>(getDefaultReplyStickers());
+
+    useEffect(() => {
+        if (loadedDefaultStickers.length > 0) return;
+
+        let cancelled = false;
+        void fetchDefaultReplyStickerPacks()
+            .then(stickers => {
+                if (!cancelled && stickers.length > 0) setLoadedDefaultStickers(stickers);
+            })
+            .catch(error => console.error("[MentionsBox] Failed to fetch default sticker packs", error));
+
+        return () => {
+            cancelled = true;
+        };
+    }, [loadedDefaultStickers.length]);
+
+    const defaultStickers = loadedDefaultStickers.length > 0 ? loadedDefaultStickers : getDefaultReplyStickers();
+    const stickerMap = StickersStore.getAllGuildStickers?.();
+    const stickerGroups: Array<{ id: string; name: string; stickers: Sticker[]; }> = [
+        { id: "default", name: "Default", stickers: defaultStickers }
+    ];
+
+    stickerMap?.forEach((stickers: Sticker[], guildId: string) => {
+        const previewableStickers = stickers.filter(isPreviewableSticker);
+        if (!previewableStickers.length) return;
+
+        stickerGroups.push({
+            id: guildId,
+            name: GuildStore.getGuild(guildId)?.name ?? "Unknown Server",
+            stickers: previewableStickers
+        });
+    });
+
+    const allStickers = stickerGroups.flatMap(group => group.stickers);
+    const visibleStickers = selectedGroupId === "all"
+        ? allStickers
+        : stickerGroups.find(group => group.id === selectedGroupId)?.stickers ?? [];
+    const filteredStickers = visibleStickers
+        .filter(sticker => matchesStickerSearch(sticker, search))
+        .slice(0, 120);
+
+    return (
+        <>
+            <div className="vc-mentions-box-sticker-header">
+                <div className="vc-mentions-box-emoji-search-wrap">
+                    <span className="vc-mentions-box-emoji-search-icon">🔍</span>
+                    <input
+                        className="vc-mentions-box-emoji-search"
+                        placeholder="Search stickers..."
+                        value={search}
+                        onChange={event => setSearch(event.currentTarget.value)}
+                        onKeyDown={event => event.stopPropagation()}
+                        autoFocus
+                    />
+                </div>
+            </div>
+            <div className="vc-mentions-box-sticker-tabs">
+                <StickerPickerTab active={selectedGroupId === "default"} onClick={() => setSelectedGroupId("default")}>
+                    Default ({defaultStickers.length})
+                </StickerPickerTab>
+                <StickerPickerTab active={selectedGroupId === "all"} onClick={() => setSelectedGroupId("all")}>
+                    All ({allStickers.length})
+                </StickerPickerTab>
+                {stickerGroups.slice(1).map(group => (
+                    <StickerPickerTab key={group.id} active={selectedGroupId === group.id} onClick={() => setSelectedGroupId(group.id)}>
+                        {group.name}
+                    </StickerPickerTab>
+                ))}
+            </div>
+            <div className="vc-mentions-box-sticker-grid">
+                {allStickers.length === 0 ? (
+                    <div className="vc-mentions-box-sticker-empty">Loading stickers...</div>
+                ) : filteredStickers.length === 0 ? (
+                    <div className="vc-mentions-box-sticker-empty">
+                        {search.trim() ? `No results for "${search}".` : "No stickers in this tab."}
+                    </div>
+                ) : filteredStickers.map(sticker => {
+                    const formatType = getStickerFormatType(sticker);
+                    const stickerUrl = getStickerMediaUrl(sticker, 96);
+                    const selected = selectedId === sticker.id;
+
+                    return (
+                        <button
+                            key={sticker.id}
+                            type="button"
+                            className={`vc-mentions-box-sticker-button${selected ? " vc-mentions-box-sticker-button-selected" : ""}`}
+                            onClick={() => {
+                                onSelect(selected ? null : {
+                                    id: sticker.id,
+                                    name: getStickerName(sticker),
+                                    formatType
+                                });
+                                closePopout();
+                            }}
+                            title={getStickerName(sticker)}
+                            aria-pressed={selected}
+                        >
+                            {stickerUrl ? (
+                                <img className="vc-mentions-box-sticker-img" src={stickerUrl} alt={getStickerName(sticker)} />
+                            ) : (
+                                <span className="vc-mentions-box-sticker-fallback">Sticker</span>
+                            )}
+                            <span className="vc-mentions-box-sticker-name">{getStickerName(sticker)}</span>
+                        </button>
+                    );
+                })}
+            </div>
+        </>
+    );
+}
+
 function getReferencedMessage(message: any) {
     const direct = message?.referenced_message ?? message?.referencedMessage;
-    if (direct) return direct;
+    if (direct) {
+        const channelId = direct.channel_id ?? direct.channelId ?? message?.channel_id ?? message?.channelId;
+        return (channelId && direct.id ? MessageStore.getMessage(channelId, direct.id) : null) ?? direct;
+    }
 
     const reference = getMessageReference(message);
     const channelId = reference?.channel_id ?? reference?.channelId ?? message?.channel_id ?? message?.channelId;
@@ -1101,6 +1594,31 @@ function makeReplyPreview(message: any): ReplyPreview | null {
     };
 }
 
+function makeNoticeReplyPreview(notice: MentionNotice): ReplyPreview {
+    return {
+        id: notice.id,
+        authorName: notice.authorName,
+        avatarUrl: notice.avatarUrl,
+        content: notice.content.length > REF_CONTENT_TRUNCATE_LENGTH
+            ? `${notice.content.slice(0, REF_CONTENT_TRUNCATE_LENGTH)}…`
+            : notice.content,
+        channelId: notice.channelId,
+        media: notice.media
+    };
+}
+
+function rememberSentReplyChain(notice: MentionNotice, sentMessage: any) {
+    const sentPreview = makeReplyPreview(sentMessage);
+    if (!sentPreview) return;
+
+    sentReplyChains.set(sentPreview.id, [
+        ...(notice.kind === "typing" ? [] : [...notice.replyChain, makeNoticeReplyPreview(notice)]),
+        sentPreview
+    ]);
+
+    if (sentReplyChains.size > 100) sentReplyChains.delete(sentReplyChains.keys().next().value!);
+}
+
 function collectReplyChain(message: MessageJSON | any) {
     const chain: ReplyPreview[] = [];
     const seen = new Set<string>();
@@ -1116,6 +1634,68 @@ function collectReplyChain(message: MessageJSON | any) {
     }
 
     return chain;
+}
+
+async function hydrateNoticeReplyChain(notice: MentionNotice, sourceMessage?: any, updateStore = true): Promise<MentionNotice> {
+    if (notice.kind === "reaction" || notice.kind === "typing") return notice;
+
+    const root = sourceMessage ?? MessageStore.getMessage(notice.channelId, notice.id);
+    if (!root || !getMessageReference(root)) return notice;
+
+    const seen = new Set<string>();
+    let current = root;
+
+    while (seen.size < 8) {
+        const reference = getMessageReference(current);
+        const channelId = reference?.channel_id ?? reference?.channelId ?? current?.channel_id ?? current?.channelId ?? notice.channelId;
+        const messageId = reference?.message_id ?? reference?.messageId;
+        if (!channelId || !messageId || seen.has(messageId)) break;
+        seen.add(messageId);
+
+        const direct = current?.referenced_message ?? current?.referencedMessage;
+        let referenced = MessageStore.getMessage(channelId, messageId) ?? direct;
+
+        if (!referenced || (referenced.type === MessageType.REPLY && !getMessageReference(referenced))) {
+            const response = await RestAPI.get({
+                url: Constants.Endpoints.MESSAGE(channelId, messageId),
+                retries: 1
+            }).catch(error => {
+                console.warn("[MentionsBox] Failed to load reply chain message", error);
+                return null;
+            });
+
+            if (response?.body) referenced = receiveMessage(channelId, response.body);
+        }
+
+        if (!referenced) break;
+        current = referenced;
+    }
+
+    const replyChain = collectReplyChain(root);
+    const immediateReply = replyChain.at(-1);
+    if (!immediateReply) return notice;
+
+    const hydratedNotice = {
+        ...notice,
+        replyChain,
+        referencedContent: immediateReply.content,
+        referencedAuthorName: immediateReply.authorName
+    };
+    if (!updateStore) return hydratedNotice;
+
+    const existingNotice = notices.find(currentNotice => currentNotice.id === notice.id && currentNotice.channelId === notice.channelId);
+    if (existingNotice && existingNotice.replyChain.length >= replyChain.length) return existingNotice;
+
+    setNotices(notices.map(currentNotice => currentNotice.id === notice.id && currentNotice.channelId === notice.channelId
+        ? {
+            ...currentNotice,
+            replyChain,
+            referencedContent: immediateReply.content,
+            referencedAuthorName: immediateReply.authorName
+        }
+        : currentNotice));
+
+    return hydratedNotice;
 }
 
 function ReplyChain({ replies }: { replies: ReplyPreview[]; }) {
@@ -1144,23 +1724,79 @@ function ReplyChain({ replies }: { replies: ReplyPreview[]; }) {
     );
 }
 
+function messageMentionsUser(message: MessageJSON | any, userId: string) {
+    if (userId === UserStore.getCurrentUser()?.id) {
+        const messageId = message?.id ?? message?.message_id ?? message?.messageId;
+        if (messageId && keywordNotifierMentionIds.has(messageId)) return true;
+    }
+
+    const { mentions } = message;
+    if (Array.isArray(mentions)) {
+        return mentions.some(user => (typeof user === "string" ? user : user?.id) === userId);
+    }
+
+    if (mentions instanceof Set) {
+        return mentions.has(userId)
+            || [...mentions].some(user => (typeof user === "string" ? user : (user as any)?.id) === userId);
+    }
+
+    return Boolean(mentions?.[userId]);
+}
+
+function isReplyToRememberedChain(message: MessageJSON | any) {
+    const reference = getMessageReference(message);
+    const referenceId = reference?.message_id ?? reference?.messageId;
+    return Boolean(referenceId && sentReplyChains.has(referenceId));
+}
+
+function isReplyToMessageMentioningUser(message: MessageJSON | any, userId: string) {
+    if (!settings.store.showRepliesToMentionedMessages) return false;
+
+    const seen = new Set<string>();
+    const reference = getMessageReference(message);
+    const referenceId = reference?.message_id ?? reference?.messageId;
+    if (userId === UserStore.getCurrentUser()?.id && referenceId && keywordNotifierMentionIds.has(referenceId)) return true;
+
+    let current = getReferencedMessage(message);
+
+    while (current && seen.size < 8) {
+        const id = current.id ?? current.message_id ?? current.messageId;
+        if (id) {
+            if (seen.has(id)) break;
+            seen.add(id);
+        } else {
+            seen.add(`${seen.size}`);
+        }
+
+        if (messageMentionsUser(current, userId)) return true;
+        current = getReferencedMessage(current);
+    }
+
+    return false;
+}
+
+function shouldAutoReadBotMention(message: MessageJSON | any) {
+    const currentUser = UserStore.getCurrentUser();
+
+    return Boolean(
+        settings.store.autoReadBotMentions
+        && currentUser
+        && message?.id
+        && message?.author?.bot
+        && message.author.id !== currentUser.id
+        && messageMentionsUser(message, currentUser.id)
+    );
+}
+
 function isRelevantMention(message: MessageJSON | any) {
     const currentUser = UserStore.getCurrentUser();
 
     if (!currentUser || !message.author || message.author.id === currentUser.id) return false;
     if (settings.store.hideBotMentions && message.author.bot) return false;
 
-    const { mentions } = message;
-    if (Array.isArray(mentions)) {
-        return mentions.some(user => (typeof user === "string" ? user : user?.id) === currentUser.id);
-    }
-
-    if (mentions instanceof Set) {
-        return mentions.has(currentUser.id)
-            || [...mentions].some(user => (typeof user === "string" ? user : (user as any)?.id) === currentUser.id);
-    }
-
-    return Boolean(mentions?.[currentUser.id]);
+    return messageMentionsUser(message, currentUser.id)
+        || isReplyToRememberedChain(message)
+        || isReplyToMessageMentioningUser(message, currentUser.id);
 }
 
 function buildNoticeFromMessage(
@@ -1189,11 +1825,19 @@ function buildNoticeFromMessage(
 
     const guild = guildId ? GuildStore.getGuild(guildId) : null;
     const author = UserStore.getUser(displayAuthor.id);
+    const currentUser = UserStore.getCurrentUser();
+    const isReplyToMentionedMessage = Boolean(
+        currentUser
+        && !messageMentionsUser(displayMessage, currentUser.id)
+        && (isReplyToRememberedChain(displayMessage) || isReplyToMessageMentioningUser(displayMessage, currentUser.id))
+    );
     const authorName = getAuthorName({
         ...displayMessage,
         author: displayAuthor
     });
-    const replyChain = collectReplyChain(displayMessage);
+    const reference = getMessageReference(displayMessage);
+    const referenceId = reference?.message_id ?? reference?.messageId;
+    const replyChain = (referenceId && sentReplyChains.get(referenceId)) ?? collectReplyChain(displayMessage);
     const refMsg = (displayMessage as any).referenced_message ?? (displayMessage as any).referencedMessage;
     let referencedContent = replyChain.at(-1)?.content;
     let referencedAuthorName = replyChain.at(-1)?.authorName;
@@ -1235,10 +1879,115 @@ function buildNoticeFromMessage(
         referencedContent,
         referencedAuthorName,
         replyChain,
-        media: collectMessageMedia(displayMessage),
+        media: collectMessageMedia(displayMessage, message),
         reactedEmojiKeys: reactions.filter(reaction => reaction.me).map(getStoredReactionKey),
         reactions,
-        timestamp: getMessageTimestamp(displayMessage)
+        timestamp: getMessageTimestamp(displayMessage),
+        ...(isReplyToMentionedMessage ? { kind: "reply-to-mention" as const } : {})
+    };
+}
+
+function buildNoticeFromReaction(payload: MessageReactionPayload): MentionNotice | null {
+    if (!settings.store.showReactionMentions) return null;
+
+    const currentUser = UserStore.getCurrentUser();
+    const reactorId = getReactionPayloadUserId(payload);
+    const channelId = getReactionPayloadChannelId(payload);
+    const messageId = getReactionPayloadMessageId(payload);
+    if (!currentUser || !reactorId || !channelId || !messageId || reactorId === currentUser.id) return null;
+
+    const message = MessageStore.getMessage(channelId, messageId) as any;
+    const messageAuthorId = message?.author?.id ?? message?.authorId;
+    if (messageAuthorId !== currentUser.id) return null;
+
+    const channel = ChannelStore.getChannel(channelId);
+    const guildId = channel?.guild_id ?? getReactionPayloadGuildId(payload) ?? message?.guild_id ?? message?.guildId ?? null;
+    if (settings.store.hideDmMentions && (!channel || channel.type === ChannelType.DM)) return null;
+
+    const guild = guildId ? GuildStore.getGuild(guildId) : null;
+    const reactor = UserStore.getUser(reactorId);
+    if (settings.store.hideBotMentions && reactor?.bot) return null;
+
+    const authorName = RelationshipStore.getNickname(reactorId)
+        ?? (reactor as any)?.globalName
+        ?? (reactor as any)?.global_name
+        ?? reactor?.username
+        ?? "Someone";
+    const originalContent = formatContent(message as MessageJSON);
+    const reactions = (message.reactions ?? []).map((reaction: any) => ({
+        count: reaction.count ?? 0,
+        me: Boolean(reaction.me || reaction.me_burst),
+        emoji: {
+            id: reaction.emoji?.id ?? null,
+            name: reaction.emoji?.name ?? "?",
+            animated: reaction.emoji?.animated
+        }
+    }));
+
+    return {
+        id: messageId,
+        channelId,
+        guildId,
+        authorId: reactorId,
+        authorName,
+        authorUsername: reactor?.username ?? authorName,
+        authorDisplayName: (reactor as any)?.globalName
+            ?? (reactor as any)?.global_name
+            ?? reactor?.username
+            ?? authorName,
+        authorBot: Boolean(reactor?.bot),
+        avatarUrl: reactor?.getAvatarURL?.(undefined, 64),
+        channelName: channel ? getChannelName(channel) : `<#${channelId}>`,
+        guildName: guild?.name,
+        content: "reacted to your message",
+        referencedContent: originalContent,
+        referencedAuthorName: "You",
+        replyChain: [],
+        media: collectMessageMedia(message),
+        reactedEmojiKeys: [],
+        reactions,
+        timestamp: Date.now(),
+        kind: "reaction"
+    };
+}
+
+function buildNoticeFromTyping(payload: TypingStartPayload): MentionNotice | null {
+    if (!settings.store.showDmTypingMentions) return null;
+
+    const channelId = payload.channelId ?? payload.channel_id;
+    const userId = payload.userId ?? payload.user_id;
+    const currentUser = UserStore.getCurrentUser();
+    if (!channelId || !userId || !currentUser || userId === currentUser.id) return null;
+
+    const channel = ChannelStore.getChannel(channelId);
+    if (!channel || channel.type !== ChannelType.DM) return null;
+
+    const user = UserStore.getUser(userId);
+    if (settings.store.hideBotMentions && user?.bot) return null;
+
+    const authorName = RelationshipStore.getNickname(userId)
+        ?? user?.globalName
+        ?? user?.username
+        ?? "Someone";
+
+    return {
+        id: `typing:${channelId}:${userId}`,
+        channelId,
+        guildId: null,
+        authorId: userId,
+        authorName,
+        authorUsername: user?.username ?? authorName,
+        authorDisplayName: user?.globalName ?? user?.username ?? authorName,
+        authorBot: Boolean(user?.bot),
+        avatarUrl: user?.getAvatarURL?.(undefined, 64),
+        channelName: getChannelName(channel),
+        content: "is typing in your DMs…",
+        replyChain: [],
+        media: [],
+        reactedEmojiKeys: [],
+        reactions: [],
+        timestamp: Date.now(),
+        kind: "typing"
     };
 }
 
@@ -1303,29 +2052,87 @@ async function setReactionOnNotice(notice: MentionNotice, emoji: Emoji, isReacte
     }
 }
 
-async function sendReplyToNotice(notice: MentionNotice, content: string) {
-    const messageReference: ReplyMessageReference = {
-        channel_id: notice.channelId,
-        message_id: notice.id
-    };
-    if (notice.guildId) messageReference.guild_id = notice.guildId;
+async function uploadReplyAttachment(file: File, channelId: string) {
+    const upload = new CloudUpload({
+        file,
+        isThumbnail: false,
+        platform: CloudUploadPlatform.WEB
+    }, channelId);
 
-    await RestAPI.post({
+    return new Promise<TCloudUpload>((resolve, reject) => {
+        upload.on("complete", () => resolve(upload));
+        upload.on("error", reject);
+        upload.upload().catch(reject);
+    });
+}
+
+async function sendReplyToNotice(notice: MentionNotice, content: string, stickerIds: string[] = [], uploads: TCloudUpload[] = []) {
+    const isTypingNotice = notice.kind === "typing";
+    const messageReference: ReplyMessageReference | null = isTypingNotice ? null : {
+            channel_id: notice.channelId,
+            message_id: notice.id
+        };
+    if (notice.guildId && messageReference) messageReference.guild_id = notice.guildId;
+
+    const response = await RestAPI.post({
         url: Constants.Endpoints.MESSAGES(notice.channelId),
         body: {
             allowed_mentions: {
                 parse: [],
                 replied_user: true
             },
+            attachments: uploads.map((upload, index) => ({
+                id: String(index),
+                filename: upload.filename,
+                uploaded_filename: upload.uploadedFilename
+            })),
             channel_id: notice.channelId,
             content,
             flags: 0,
-            message_reference: messageReference,
+            ...(messageReference ? { message_reference: messageReference } : {}),
             nonce: `${Date.now()}`,
+            ...(stickerIds.length > 0 ? { sticker_ids: stickerIds } : {}),
             tts: false,
             type: 0
         }
     });
+
+    rememberSentReplyChain(notice, response?.body ?? response);
+}
+
+function wait(ms: number) {
+    return new Promise<void>(resolve => window.setTimeout(resolve, ms));
+}
+
+function getRestErrorBody(error: any) {
+    return error?.body ?? error?.response?.body ?? error?.data ?? null;
+}
+
+function isSendCooldownError(error: any) {
+    const body = getRestErrorBody(error);
+    const status = Number(error?.status ?? error?.response?.status ?? body?.status);
+    const code = Number(body?.code ?? error?.code);
+    const message = `${body?.message ?? error?.message ?? ""}`.toLowerCase();
+
+    return status === 429
+        || code === 20016
+        || message.includes("slowmode")
+        || message.includes("rate limit")
+        || message.includes("rate limited");
+}
+
+async function sendReplyToNoticeWithCooldownRetry(notice: MentionNotice, content: string, stickerIds: string[] = [], files: File[] = []) {
+    const uploads = await Promise.all(files.map(file => uploadReplyAttachment(file, notice.channelId)));
+
+    for (;;) {
+        try {
+            await sendReplyToNotice(notice, content, stickerIds, uploads);
+            return;
+        } catch (error) {
+            if (!isSendCooldownError(error)) throw error;
+            await wait(SLOWMODE_REPLY_RETRY_DELAY_MS);
+        }
+    }
 }
 
 function receiveMessage(channelId: string, rawMessage: any) {
@@ -1343,7 +2150,7 @@ function isMessageAfterAck(message: any, channelId: string) {
 
 function isUnreadMentionMessage(message: any, channelId = message?.channel_id ?? message?.channelId) {
     if (!message?.id || !channelId) return false;
-    return isMessageAfterAck(message, channelId);
+    return ReadStateStore.hasUnread(channelId) && isMessageAfterAck(message, channelId);
 }
 
 async function fetchRecentMentionMessages() {
@@ -1375,6 +2182,11 @@ async function fetchRecentMentionMessages() {
             const channelId = rawMessage.channel_id ?? rawMessage.channelId;
             if (!isUnreadMentionMessage(rawMessage, channelId)) continue;
             if (dismissedNoticeIds.has(rawMessage.id)) continue;
+            if (shouldAutoReadBotMention(rawMessage)) {
+                markMessageRead(channelId, rawMessage.id);
+                dismissedNoticeIds.add(rawMessage.id);
+                continue;
+            }
             if (!isRelevantMention(rawMessage)) continue;
 
             const message = receiveMessage(channelId, rawMessage);
@@ -1396,6 +2208,41 @@ async function fetchRecentMentionMessages() {
     return foundMessages;
 }
 
+async function fetchKeywordNotifierMentionMessages() {
+    const currentUser = UserStore.getCurrentUser();
+    if (!currentUser) return [];
+
+    const foundMessages: LoadedRecentMentionMessage[] = [];
+    const keywordMessages = await getKeywordNotifierMessages();
+    keywordNotifierMentionIds = new Set(
+        keywordMessages.map(message => message.id ?? message.message_id ?? message.messageId).filter(Boolean)
+    );
+
+    for (const rawMessage of keywordMessages) {
+        const channelId = rawMessage.channel_id ?? rawMessage.channelId;
+        if (!channelId || !isUnreadMentionMessage(rawMessage, channelId)) continue;
+        if (dismissedNoticeIds.has(rawMessage.id)) continue;
+        if (shouldAutoReadBotMention(rawMessage)) {
+            markMessageRead(channelId, rawMessage.id);
+            dismissedNoticeIds.add(rawMessage.id);
+            continue;
+        }
+
+        rawMessage.mentions ??= [];
+        if (Array.isArray(rawMessage.mentions) && !rawMessage.mentions.some((mention: any) => (mention?.id ?? mention) === currentUser.id)) {
+            rawMessage.mentions.push({ id: currentUser.id });
+        }
+        if (!isRelevantMention(rawMessage)) continue;
+
+        foundMessages.push({
+            processed: receiveMessage(channelId, rawMessage),
+            raw: rawMessage
+        });
+    }
+
+    return foundMessages;
+}
+
 function refreshReadStatePayload(payload: any, delay = 150) {
     scheduleUnreadMentionsLoad(delay, Boolean(payload));
 }
@@ -1410,7 +2257,17 @@ async function loadUnreadMentions() {
     const unreadNotices: MentionNotice[] = [];
 
     try {
-        for (const { processed, raw } of await fetchRecentMentionMessages()) {
+        const loadedMessages = [
+            ...await fetchRecentMentionMessages(),
+            ...await fetchKeywordNotifierMentionMessages()
+        ];
+        const seenMessageIds = new Set<string>();
+        const sourceMessages = new Map<string, any>();
+
+        for (const { processed, raw } of loadedMessages) {
+            if (raw.id && seenMessageIds.has(raw.id)) continue;
+            if (raw.id) seenMessageIds.add(raw.id);
+
             const channelId = raw.channel_id ?? raw.channelId ?? processed.channel_id ?? processed.channelId;
             const channel = channelId ? ChannelStore.getChannel(channelId) : null;
             const notice = buildNoticeFromMessage(
@@ -1420,10 +2277,16 @@ async function loadUnreadMentions() {
                 true,
                 raw
             );
-            if (notice) unreadNotices.push(notice);
+            if (notice) {
+                unreadNotices.push(notice);
+                sourceMessages.set(notice.id, raw);
+            }
         }
 
-        syncUnreadNotices(unreadNotices);
+        const hydratedNotices = await Promise.all(unreadNotices.map(notice =>
+            hydrateNoticeReplyChain(notice, sourceMessages.get(notice.id), false)
+        ));
+        syncUnreadNotices(hydratedNotices);
     } catch (error) {
         console.error("[MentionsBox] Failed to load unread mentions", error);
     } finally {
@@ -1510,9 +2373,15 @@ const globalKeydownListener = (event: KeyboardEvent) => {
         return;
     }
 
-    if (shouldHandleGlobalKeybind(event, settings.store.jumpToggleKeybind)) {
+    if (shouldHandleGlobalKeybind(event, settings.store.jumpOnReplyToggleKeybind)) {
         consumeGlobalKeybind(event);
-        toggleJumpToMentionOnClick(true);
+        toggleJumpOnReply(true);
+        return;
+    }
+
+    if (shouldHandleGlobalKeybind(event, settings.store.sourceFilterToggleKeybind)) {
+        consumeGlobalKeybind(event);
+        toggleSourceFilter();
     }
 };
 
@@ -1530,6 +2399,14 @@ function useNotificationsHidden() {
     useEffect(() => subscribe(() => setIsHidden(areNotificationsHidden)), []);
 
     return isHidden;
+}
+
+function useSourceFilterVisible() {
+    const [isVisible, setIsVisible] = useState(isSourceFilterVisible);
+
+    useEffect(() => subscribe(() => setIsVisible(isSourceFilterVisible)), []);
+
+    return isVisible;
 }
 
 function useKeybindToast() {
@@ -1615,6 +2492,8 @@ function dedupeEmojis(emojis: Emoji[]) {
 function getReplyPlaceholderReplacements(notice: MentionNotice): Record<string, string> {
     const me = UserStore.getCurrentUser();
     const meNickname = me?.id ? RelationshipStore.getNickname(me.id) : null;
+    const authorServerNickname = notice.guildId ? GuildMemberStore.getMember(notice.guildId, notice.authorId)?.nick : null;
+    const meServerNickname = notice.guildId && me?.id ? GuildMemberStore.getMember(notice.guildId, me.id)?.nick : null;
     const meDisplayName = (me as any)?.globalName ?? (me as any)?.global_name ?? me?.username ?? "me";
     const meName = meNickname ?? meDisplayName;
     const messageLink = `https://discord.com/channels/${notice.guildId ?? "@me"}/${notice.channelId}/${notice.id}`;
@@ -1630,18 +2509,21 @@ function getReplyPlaceholderReplacements(notice: MentionNotice): Record<string, 
         "reply.author.name": notice.referencedAuthorName ?? "",
         "replied-user.name": notice.authorName,
         "replied-user.nickname": notice.authorName,
+        "replied-user.servernickname": authorServerNickname ?? notice.authorName,
         "replied-user.username": notice.authorUsername,
         "replied-user.displayname": notice.authorDisplayName,
         "replied-user.display-name": notice.authorDisplayName,
         "replied-user.id": notice.authorId,
         "author.name": notice.authorName,
         "author.nickname": notice.authorName,
+        "author.servernickname": authorServerNickname ?? notice.authorName,
         "author.username": notice.authorUsername,
         "author.displayname": notice.authorDisplayName,
         "author.display-name": notice.authorDisplayName,
         "author.id": notice.authorId,
         "me.name": meName,
         "me.nickname": meNickname ?? meName,
+        "me.servernickname": meServerNickname ?? meName,
         "me.username": me?.username ?? meName,
         "me.displayname": meDisplayName,
         "me.display-name": meName,
@@ -1676,7 +2558,7 @@ function getPreselectedDialogues(): PreselectedDialogue[] {
     return saved.map(normalizeDialogue);
 }
 
-type KeybindSetting = "hideToggleKeybind" | "dialogueModeToggleKeybind" | "jumpToggleKeybind";
+type KeybindSetting = "hideToggleKeybind" | "dialogueModeToggleKeybind" | "jumpOnReplyToggleKeybind" | "sourceFilterToggleKeybind" | "replyChainToggleKeybind";
 
 function normalizeRecordedKey(key: string) {
     if (key === " ") return "SPACE";
@@ -1773,7 +2655,111 @@ function KeybindSettings() {
         <div className="vc-mentions-box-settings-keybinds">
             <KeybindInput label="Toggle hiding MentionsBox" settingKey="hideToggleKeybind" defaultKeybind={DEFAULT_HIDE_TOGGLE_KEYBIND} />
             <KeybindInput label="Toggle interaction button mode" settingKey="dialogueModeToggleKeybind" defaultKeybind={DEFAULT_DIALOGUE_MODE_TOGGLE_KEYBIND} />
-            <KeybindInput label="Toggle card click jumping" settingKey="jumpToggleKeybind" defaultKeybind={DEFAULT_JUMP_TOGGLE_KEYBIND} />
+            <KeybindInput label="Toggle jump on reply" settingKey="jumpOnReplyToggleKeybind" defaultKeybind={DEFAULT_JUMP_ON_REPLY_TOGGLE_KEYBIND} />
+            <KeybindInput label="Toggle server and DM filter" settingKey="sourceFilterToggleKeybind" defaultKeybind={DEFAULT_SOURCE_FILTER_TOGGLE_KEYBIND} />
+            <KeybindInput label="Toggle focused reply chain" settingKey="replyChainToggleKeybind" defaultKeybind={DEFAULT_REPLY_CHAIN_TOGGLE_KEYBIND} />
+        </div>
+    );
+}
+
+function PlaceholderOrderSettings() {
+    const [, forceUpdate] = useState(0);
+    const [selectedKey, setSelectedKey] = useState<string | null>(null);
+    const order = getPlaceholderOrder();
+    const enabledPlaceholders = order
+        .map(key => REPLY_PLACEHOLDERS.find(placeholder => placeholder.key === key))
+        .filter(Boolean) as typeof REPLY_PLACEHOLDERS;
+    const disabledPlaceholders = REPLY_PLACEHOLDERS.filter(placeholder => !order.includes(placeholder.key));
+    const selectedIndex = order.findIndex(key => key === selectedKey);
+    const selectedPlaceholder = REPLY_PLACEHOLDERS.find(placeholder => placeholder.key === selectedKey);
+
+    function setOrder(next: string[]) {
+        settings.store.placeholderOrder = next;
+        if (selectedKey && !next.includes(selectedKey)) setSelectedKey(next[Math.min(selectedIndex, next.length - 1)] ?? null);
+        forceUpdate(version => version + 1);
+    }
+
+    function moveSelected(direction: -1 | 1) {
+        const target = selectedIndex + direction;
+        if (selectedIndex < 0 || target < 0 || target >= order.length) return;
+
+        const next = [...order];
+        [next[selectedIndex], next[target]] = [next[target], next[selectedIndex]];
+        setOrder(next);
+    }
+
+    return (
+        <div className="vc-mentions-box-settings">
+            <div>
+                <div className="vc-mentions-box-settings-heading">Placeholder autocomplete order</div>
+                <div className="vc-mentions-box-settings-description">
+                    Move placeholders left/right to change tab-autocomplete priority. Disabled placeholders stay hidden.
+                </div>
+            </div>
+            <div className="vc-mentions-box-settings-subheading">Enabled placeholders</div>
+            <div className="vc-mentions-box-settings-preview" aria-label="Enabled placeholder order">
+                {enabledPlaceholders.length ? enabledPlaceholders.map(placeholder => (
+                    <button
+                        className={`vc-mentions-box-settings-preview-button${placeholder.key === selectedKey ? " vc-mentions-box-settings-preview-button-selected" : ""}`}
+                        key={placeholder.key}
+                        type="button"
+                        onClick={() => setSelectedKey(placeholder.key)}
+                        title={placeholder.description}
+                    >
+                        {`{${placeholder.key}}`}
+                    </button>
+                )) : (
+                    <div className="vc-mentions-box-settings-empty">No placeholders enabled.</div>
+                )}
+            </div>
+            {selectedPlaceholder && selectedIndex !== -1 && (
+                <div className="vc-mentions-box-settings-editor">
+                    <div className="vc-mentions-box-settings-description">
+                        <strong>{selectedPlaceholder.label}</strong> — {selectedPlaceholder.description}
+                    </div>
+                    <div className="vc-mentions-box-settings-editor-actions">
+                        <button
+                            className="vc-mentions-box-settings-move"
+                            type="button"
+                            disabled={selectedIndex === 0}
+                            onClick={() => moveSelected(-1)}
+                        >
+                            Move left
+                        </button>
+                        <button
+                            className="vc-mentions-box-settings-move"
+                            type="button"
+                            disabled={selectedIndex === order.length - 1}
+                            onClick={() => moveSelected(1)}
+                        >
+                            Move right
+                        </button>
+                        <button
+                            className="vc-mentions-box-settings-remove"
+                            type="button"
+                            onClick={() => setOrder(order.filter(key => key !== selectedPlaceholder.key))}
+                        >
+                            Disable selected
+                        </button>
+                    </div>
+                </div>
+            )}
+            <div className="vc-mentions-box-settings-subheading">Disabled placeholders</div>
+            <div className="vc-mentions-box-settings-preview" aria-label="Disabled placeholders">
+                {disabledPlaceholders.length ? disabledPlaceholders.map(placeholder => (
+                    <button
+                        className="vc-mentions-box-settings-preview-button vc-mentions-box-settings-preview-button-disabled"
+                        key={placeholder.key}
+                        type="button"
+                        onClick={() => setOrder([...order, placeholder.key])}
+                        title={`Enable ${placeholder.label}`}
+                    >
+                        {`{${placeholder.key}}`}
+                    </button>
+                )) : (
+                    <div className="vc-mentions-box-settings-empty">No disabled placeholders.</div>
+                )}
+            </div>
         </div>
     );
 }
@@ -1951,14 +2937,47 @@ function translateEmojiShortcodes(content: string, guildId: string | null, curso
     };
 }
 
-function MentionCard({ notice }: { notice: MentionNotice; }) {
+function getClipboardFiles(data: DataTransfer) {
+    const files = [...Array.from(data.files), ...Array.from(data.items)
+        .filter(item => item.kind === "file")
+        .map(item => item.getAsFile())
+        .filter((file): file is File => file != null)];
+
+    return [...new Map(files.map(file => [`${file.name}:${file.type}:${file.size}`, file])).values()];
+}
+
+function ReplyMediaPreview({ file, onRemove }: { file: File; onRemove(): void; }) {
+    const [previewUrl, setPreviewUrl] = useState("");
+    const isImage = file.type.startsWith("image/") || IMAGE_EXTENSIONS.test(file.name);
+    const isVideo = file.type.startsWith("video/") || VIDEO_EXTENSIONS.test(file.name);
+
+    useEffect(() => {
+        const url = URL.createObjectURL(file);
+        setPreviewUrl(url);
+        return () => URL.revokeObjectURL(url);
+    }, [file]);
+
+    return (
+        <div className="vc-mentions-box-reply-media">
+            {isImage && previewUrl
+                ? <img src={previewUrl} alt="" />
+                : isVideo && previewUrl
+                    ? <video src={previewUrl} aria-hidden />
+                    : <span className="vc-mentions-box-reply-media-file" aria-hidden>▧</span>}
+            <span className="vc-mentions-box-reply-media-name">{file.name || "Pasted media"}</span>
+            <button type="button" onClick={onRemove} aria-label={`Remove ${file.name || "pasted media"}`}>Remove</button>
+        </div>
+    );
+}
+
+function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?: (id: string, focusReplyInput?: boolean, focusAfterJump?: boolean) => void; }) {
     const [replyContent, setReplyContent] = useState("");
-    const [isSendingReply, setIsSendingReply] = useState(false);
-    const [isExpanded, setIsExpanded] = useState(false);
-    const [isReplyExpanded, setIsReplyExpanded] = useState(false);
+    const [isExpanded, setIsExpanded] = useState(() => settings.store.autoExpandReadMore);
+    const [isReplyExpanded, setIsReplyExpanded] = useState(() => settings.store.autoViewReplyChain);
     const [isInteractionExpanded, setIsInteractionExpanded] = useState(false);
     const [isHovered, setIsHovered] = useState(false);
     const [isFocusedWithin, setIsFocusedWithin] = useState(false);
+    const [replyInputFocused, setReplyInputFocused] = useState(false);
     const [externalReactionDismissProgress, setExternalReactionDismissProgress] = useState(0);
     const [interactionSearch, setInteractionSearchRaw] = useState(
         () => settings.store.persistInteractionSearch ? sharedInteractionSearch : ""
@@ -1966,21 +2985,29 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
     const [cursorPos, setCursorPos] = useState(0);
     const [autocompleteIndex, setAutocompleteIndex] = useState(0);
     const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+    const [showStickerPicker, setShowStickerPicker] = useState(false);
     const [emojiSearch, setEmojiSearch] = useState("");
     const [hoveredEmoji, setHoveredEmoji] = useState<Emoji | null>(null);
+    const [selectedSticker, setSelectedSticker] = useState<SelectedReplySticker>(null);
+    const [replyFiles, setReplyFiles] = useState<File[]>([]);
     const [contentOverflows, setContentOverflows] = useState(false);
     const [pickerPos, setPickerPos] = useState<{ bottom: number; right: number; } | null>(null);
+    const [stickerPickerPos, setStickerPickerPos] = useState<{ bottom: number; right: number; } | null>(null);
     const [autocompletePosition, setAutocompletePosition] = useState<ReplyAutocompletePosition | null>(null);
     const replyInputRef = useRef<HTMLTextAreaElement>(null);
     const emojiPickerRef = useRef<HTMLDivElement>(null);
     const pickerTriggerRef = useRef<HTMLButtonElement>(null);
+    const stickerPickerRef = useRef<HTMLDivElement>(null);
+    const stickerPickerTriggerRef = useRef<HTMLButtonElement>(null);
     const contentRef = useRef<HTMLDivElement>(null);
     const replyHistoryRef = useRef<Array<{ content: string; cursorPos: number; }>>([]);
+    const forceJumpOnSubmitRef = useRef(false);
     const isLong = contentOverflows || isExpanded;
     const displayContent = notice.content;
+    const isTypingNotice = notice.kind === "typing";
     const replyChain = notice.replyChain ?? [];
     const hasReplyPreview = replyChain.length > 0 || Boolean(notice.referencedAuthorName);
-    const { dialogueButtonMode, jumpToMentionOnClick, preselectedDialogues, persistInteractionSearch, preloadMentionContext } = settings.use(["dialogueButtonMode", "jumpToMentionOnClick", "preselectedDialogues", "persistInteractionSearch", "preloadMentionContext"]);
+    const { autoExpandReadMore, dialogueButtonMode, jumpToMentionOnClick, placeholderOrder, preselectedDialogues, persistInteractionSearch, preloadMentionContext } = settings.use(["autoExpandReadMore", "dialogueButtonMode", "jumpToMentionOnClick", "placeholderOrder", "preselectedDialogues", "persistInteractionSearch", "preloadMentionContext"]);
     const setInteractionSearch = useCallback((value: string) => {
         if (persistInteractionSearch) setSharedInteractionSearch(value);
         setInteractionSearchRaw(value);
@@ -2026,8 +3053,8 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         [emojiMatch, notice.guildId]
     );
     const placeholderSuggestions = useMemo(
-        () => placeholderMatch ? getReplyPlaceholderSuggestions(placeholderReplacements, placeholderMatch.query) : [],
-        [placeholderMatch, placeholderReplacements]
+        () => placeholderMatch ? getReplyPlaceholderSuggestions(placeholderReplacements, placeholderMatch.query, getPlaceholderOrder(placeholderOrder)) : [],
+        [placeholderMatch, placeholderOrder, placeholderReplacements]
     );
 
     useLayoutEffect(() => {
@@ -2040,6 +3067,9 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
     useEffect(() => {
         if (preloadMentionContext) preloadNoticeContext(notice);
     }, [notice, preloadMentionContext]);
+    useEffect(() => {
+        if (autoExpandReadMore) setIsExpanded(true);
+    }, [autoExpandReadMore]);
     useEffect(() => { setAutocompleteIndex(0); }, [autocompleteSuggestions.length, placeholderSuggestions.length]);
     useLayoutEffect(() => {
         const shouldShowAutocomplete = Boolean(placeholderMatch) || autocompleteSuggestions.length > 0;
@@ -2092,18 +3122,22 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         el.style.overflowY = el.scrollHeight > 200 ? "auto" : "hidden";
     }, [replyContent]);
     useEffect(() => {
-        if (!showEmojiPicker) return;
+        if (!showEmojiPicker && !showStickerPicker) return;
 
         function handleClick(event: MouseEvent) {
             if (pickerTriggerRef.current?.contains(event.target as Node)) return;
+            if (stickerPickerTriggerRef.current?.contains(event.target as Node)) return;
             if (emojiPickerRef.current && !emojiPickerRef.current.contains(event.target as Node)) {
                 setShowEmojiPicker(false);
+            }
+            if (stickerPickerRef.current && !stickerPickerRef.current.contains(event.target as Node)) {
+                setShowStickerPicker(false);
             }
         }
 
         document.addEventListener("mousedown", handleClick);
         return () => document.removeEventListener("mousedown", handleClick);
-    }, [showEmojiPicker]);
+    }, [showEmojiPicker, showStickerPicker]);
 
     useEffect(() => {
         if (!isExternalReactionDismissing || !notice.externalReactionDismissDurationMs) {
@@ -2186,9 +3220,10 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
 
     const jumpToMention = useCallback(() => {
         markNoticeRead(notice);
+        onHandled?.(notice.id);
         removeNotice(notice.id);
         jumpToNotice(notice);
-    }, [notice]);
+    }, [notice, onHandled]);
 
     const clickToMention = useCallback(() => {
         if (jumpToMentionOnClick) jumpToMention();
@@ -2215,10 +3250,30 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         });
     }, [notice]);
 
+    const markCurrentNoticeRead = useCallback((focusNextReplyInput = false) => {
+        markNoticeRead(notice);
+        onHandled?.(notice.id, focusNextReplyInput);
+        removeNotice(notice.id);
+    }, [notice, onHandled]);
+
     const dismissNotice = useCallback((event: React.MouseEvent) => {
         event.stopPropagation();
-        markNoticeRead(notice);
-        removeNotice(notice.id);
+        markCurrentNoticeRead();
+    }, [markCurrentNoticeRead]);
+
+    const sendReplyInBackground = useCallback((content: string, stickerIds: string[], failureMessage: string, delayMs: number, files: File[] = []) => {
+        window.setTimeout(() => {
+            void sendReplyToNoticeWithCooldownRetry(notice, content, stickerIds, files)
+                .catch(error => {
+                    console.error("[MentionsBox] Failed to send reply in background", error);
+                    dismissedNoticeIds.delete(notice.id);
+                    addNotice({
+                        ...notice,
+                        timestamp: Date.now()
+                    });
+                    showKeybindSettingToast(failureMessage);
+                });
+        }, delayMs);
     }, [notice]);
 
     const pushReplyHistory = useCallback(() => {
@@ -2259,27 +3314,33 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         }
     }, [notice.guildId]);
 
-    const submitReply = useCallback(async (event: React.FormEvent) => {
+    const handleReplyPaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+        const files = getClipboardFiles(event.clipboardData);
+        if (!files.length) return;
+
+        event.preventDefault();
+        setReplyFiles(current => {
+            const existing = new Set(current.map(file => `${file.name}:${file.type}:${file.size}`));
+            return [...current, ...files.filter(file => !existing.has(`${file.name}:${file.type}:${file.size}`))];
+        });
+    }, []);
+
+    const submitReply = useCallback((event: React.FormEvent) => {
         event.preventDefault();
         event.stopPropagation();
 
         const content = resolveInteractionReply(replyContent.trim(), notice).trim();
-        if (!content || isSendingReply) return;
+        const stickerIds = selectedSticker ? [selectedSticker.id] : [];
+        const shouldJumpOnReply = forceJumpOnSubmitRef.current || settings.store.jumpOnReply;
+        forceJumpOnSubmitRef.current = false;
+        if (!content && stickerIds.length === 0 && replyFiles.length === 0) return;
 
-        setIsSendingReply(true);
-        try {
-            await sendReplyToNotice(notice, content);
-            setReplyContent("");
-            replyHistoryRef.current = [];
-            markNoticeRead(notice);
-            removeNotice(notice.id);
-            if (settings.store.jumpOnReply) jumpToNotice(notice);
-        } catch (error) {
-            console.error("[MentionsBox] Failed to send reply", error);
-        } finally {
-            setIsSendingReply(false);
-        }
-    }, [isSendingReply, notice, replyContent]);
+        markNoticeRead(notice);
+        onHandled?.(notice.id, true, shouldJumpOnReply);
+        removeNotice(notice.id);
+        if (shouldJumpOnReply) jumpToNotice(notice);
+        sendReplyInBackground(content, stickerIds, "Reply failed in the background; mention restored.", shouldJumpOnReply ? 75 : 0, replyFiles);
+    }, [jumpToNotice, notice, onHandled, replyContent, replyFiles, selectedSticker, sendReplyInBackground]);
 
     const reactToMention = useCallback((event: React.MouseEvent, emoji: Emoji, isReacted: boolean) => {
         event.preventDefault();
@@ -2304,7 +3365,27 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         setPickerPos({ bottom, right });
         setEmojiSearch("");
         setHoveredEmoji(null);
+        setShowStickerPicker(false);
         setShowEmojiPicker(value => !value);
+    }, []);
+
+    const toggleStickerPicker = useCallback((event: React.MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const rect = (event.currentTarget as HTMLButtonElement).getBoundingClientRect();
+        const pickerW = Math.min(500, window.innerWidth - 48);
+        const pickerH = Math.min(510, window.innerHeight - 72);
+
+        let bottom = window.innerHeight - rect.top + 6;
+        bottom = Math.min(bottom, window.innerHeight - pickerH - 8);
+
+        let right = window.innerWidth - rect.right;
+        right = Math.min(right, window.innerWidth - pickerW - 8);
+        right = Math.max(0, right);
+
+        setStickerPickerPos({ bottom, right });
+        setShowEmojiPicker(false);
+        setShowStickerPicker(value => !value);
     }, []);
 
     const reactWithPickerEmoji = useCallback((event: React.MouseEvent, emoji: Emoji, isReacted: boolean) => {
@@ -2342,24 +3423,19 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         setIsInteractionExpanded(prev => !prev);
     }, []);
 
-    const useInteractionReply = useCallback(async (event: React.MouseEvent, content: string) => {
+    const useInteractionReply = useCallback((event: React.MouseEvent, content: string) => {
         event.preventDefault();
         event.stopPropagation();
 
         if (dialogueButtonMode === DialogueButtonMode.Send) {
-            if (!content.trim() || isSendingReply) return;
+            if (!content.trim()) return;
 
-            setIsSendingReply(true);
-            try {
-                await sendReplyToNotice(notice, content.trim());
-                markNoticeRead(notice);
-                removeNotice(notice.id);
-                if (settings.store.jumpOnReply) jumpToNotice(notice);
-            } catch (error) {
-                console.error("[MentionsBox] Failed to send interaction reply", error);
-            } finally {
-                setIsSendingReply(false);
-            }
+            const shouldJumpOnReply = settings.store.jumpOnReply;
+            markNoticeRead(notice);
+            onHandled?.(notice.id, true, shouldJumpOnReply);
+            removeNotice(notice.id);
+            if (shouldJumpOnReply) jumpToNotice(notice);
+            sendReplyInBackground(content.trim(), [], "Interaction reply failed in the background; mention restored.", shouldJumpOnReply ? 75 : 0);
             return;
         }
 
@@ -2370,7 +3446,7 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
             replyInputRef.current?.focus();
             replyInputRef.current?.setSelectionRange(content.length, content.length);
         });
-    }, [dialogueButtonMode, isSendingReply, notice, pushReplyHistory]);
+    }, [dialogueButtonMode, jumpToNotice, notice, onHandled, pushReplyHistory, sendReplyInBackground]);
 
     const deleteInteractionReply = useCallback((event: React.MouseEvent, id: string) => {
         event.preventDefault();
@@ -2437,10 +3513,29 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         });
     }, [cursorPos, pushReplyHistory, replyContent]);
 
+    const handleReplyEscapeKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+        if (event.key !== "Escape") return false;
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.nativeEvent.stopImmediatePropagation?.();
+        markCurrentNoticeRead(true);
+        return true;
+    }, [markCurrentNoticeRead]);
+
     const handleReplyKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+        if (handleReplyEscapeKeyDown(event)) return;
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z" && !event.shiftKey && undoReplyEdit()) {
             event.preventDefault();
             event.stopPropagation();
+            return;
+        }
+
+        if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            event.stopPropagation();
+            forceJumpOnSubmitRef.current = true;
+            event.currentTarget.form?.requestSubmit();
             return;
         }
 
@@ -2503,7 +3598,7 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
             event.stopPropagation();
             event.currentTarget.form?.requestSubmit();
         }
-    }, [placeholderMatch, placeholderSuggestions, autocompleteSuggestions, autocompleteIndex, insertAutocompletedPlaceholder, insertAutocompletedEmoji, openPlaceholderAutocomplete, undoReplyEdit]);
+    }, [placeholderMatch, placeholderSuggestions, autocompleteSuggestions, autocompleteIndex, handleReplyEscapeKeyDown, insertAutocompletedPlaceholder, insertAutocompletedEmoji, openPlaceholderAutocomplete, undoReplyEdit]);
 
     const handleCardBlurCapture = useCallback((event: React.FocusEvent<HTMLDivElement>) => {
         const nextTarget = event.relatedTarget;
@@ -2512,13 +3607,29 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
         setIsFocusedWithin(false);
     }, []);
 
+    const handleCardKeyDownCapture = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+        if (!hasReplyPreview) return;
+        if (!shouldHandleGlobalKeybind(event.nativeEvent, settings.store.replyChainToggleKeybind)) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.nativeEvent.stopImmediatePropagation?.();
+        setIsReplyExpanded(prev => !prev);
+    }, [hasReplyPreview]);
+
+    const replyDisabled = !replyContent.trim() && !selectedSticker && replyFiles.length === 0;
+    const noticeKindClass = notice.kind ? ` vc-mentions-box-card-${notice.kind}` : "";
+
     return (
         <div
-            className="vc-mentions-box-card"
+            className={`vc-mentions-box-card${noticeKindClass}${notice.deleted ? " vc-mentions-box-card-deleted" : ""}`}
+            data-mention-id={notice.id}
+            tabIndex={-1}
             onMouseEnter={() => setIsHovered(true)}
             onMouseLeave={() => setIsHovered(false)}
             onFocusCapture={() => setIsFocusedWithin(true)}
             onBlurCapture={handleCardBlurCapture}
+            onKeyDownCapture={handleCardKeyDownCapture}
         >
             {isExternalReactionDismissing && (
                 <div
@@ -2563,6 +3674,11 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
                         <div ref={contentRef} className={`vc-mentions-box-content${isExpanded ? " vc-mentions-box-content--expanded" : ""}`}>
                             {renderMessageContent(displayContent, notice.channelId, notice.id)}
                         </div>
+                        {notice.deleted && (
+                            <div className="vc-mentions-box-deleted-badge">
+                                Original message deleted
+                            </div>
+                        )}
                         <MessageMedia media={notice.media ?? []} />
                         {isLong && (
                             <button
@@ -2648,7 +3764,6 @@ function MentionCard({ notice }: { notice: MentionNotice; }) {
                                             key={reply.id}
                                             className="vc-mentions-box-dialogue-button"
                                             type="button"
-                                            disabled={isSendingReply}
                                             onClick={event => useInteractionReply(event, reply.content)}
                                             onContextMenu={event => deleteInteractionReply(event, reply.id)}
                                             title={`${reply.content}
@@ -2666,7 +3781,7 @@ Right-click to delete this response`}
                         )}
                     </div>
                     <div className="vc-mentions-box-actions">
-                        <div className="vc-mentions-box-reactions" aria-label="Quick reactions">
+                        {!isTypingNotice && <div className="vc-mentions-box-reactions" aria-label="Quick reactions">
                             {quickReactionEmojis.map(emoji => {
                                 const imageUrl = getEmojiImageUrl(emoji);
                                 const label = getEmojiLabel(emoji);
@@ -2777,8 +3892,34 @@ Right-click to delete this response`}
                                     </div>,
                                     document.body
                                 )}
+                                <button
+                                    ref={stickerPickerTriggerRef}
+                                    type="button"
+                                    className={`vc-mentions-box-reaction vc-mentions-box-reaction-more vc-mentions-box-sticker-trigger${selectedSticker || showStickerPicker ? " vc-mentions-box-reaction-selected" : ""}`}
+                                    aria-label={selectedSticker ? `Selected sticker: ${selectedSticker.name}` : "Add sticker reply"}
+                                    title={selectedSticker ? `Sticker: ${selectedSticker.name}` : "Add sticker reply"}
+                                    aria-pressed={Boolean(selectedSticker || showStickerPicker)}
+                                    onClick={toggleStickerPicker}
+                                >
+                                    ▣
+                                </button>
+                                {showStickerPicker && stickerPickerPos && ReactDOM.createPortal(
+                                    <div
+                                        ref={stickerPickerRef}
+                                        className="vc-mentions-box-sticker-picker"
+                                        style={{ position: "fixed", bottom: stickerPickerPos.bottom, right: stickerPickerPos.right, zIndex: 10000 }}
+                                        onClick={event => event.stopPropagation()}
+                                    >
+                                        <MentionStickerPicker
+                                            selectedId={selectedSticker?.id ?? null}
+                                            onSelect={setSelectedSticker}
+                                            closePopout={() => setShowStickerPicker(false)}
+                                        />
+                                    </div>,
+                                    document.body
+                                )}
                             </>
-                        </div>
+                        </div>}
                         <button
                             className="vc-mentions-box-jump"
                             type="button"
@@ -2786,8 +3927,8 @@ Right-click to delete this response`}
                         >
                             Jump
                         </button>
-                        <button className="vc-mentions-box-dismiss" type="button" onClick={dismissNotice} aria-label="Dismiss mention">
-                            x
+                        <button className="vc-mentions-box-dismiss" type="button" onClick={dismissNotice} aria-label="Mark mention as read">
+                            Mark as read
                         </button>
                     </div>
                 </div>
@@ -2798,7 +3939,6 @@ Right-click to delete this response`}
                             query={placeholderMatch.query}
                             suggestions={placeholderSuggestions}
                             selectedIndex={autocompleteIndex}
-                            onHover={setAutocompleteIndex}
                             onSelect={insertAutocompletedPlaceholder}
                         />
                     )}
@@ -2835,8 +3975,43 @@ Right-click to delete this response`}
                         </div>,
                         document.body
                     )}
+                    {replyFiles.length > 0 && (
+                        <div className="vc-mentions-box-reply-media-list">
+                            {replyFiles.map(file => (
+                                <ReplyMediaPreview
+                                    key={`${file.name}:${file.type}:${file.size}`}
+                                    file={file}
+                                    onRemove={() => setReplyFiles(current => current.filter(item => item !== file))}
+                                />
+                            ))}
+                        </div>
+                    )}
+                    {selectedSticker && (
+                        <div className="vc-mentions-box-selected-sticker" onClick={event => event.stopPropagation()}>
+                            {getStickerMediaUrl({ id: selectedSticker.id, format_type: selectedSticker.formatType }, 64) ? (
+                                <img
+                                    className="vc-mentions-box-selected-sticker-img"
+                                    src={getStickerMediaUrl({ id: selectedSticker.id, format_type: selectedSticker.formatType }, 64)!}
+                                    alt={selectedSticker.name}
+                                />
+                            ) : (
+                                <span className="vc-mentions-box-selected-sticker-fallback">Sticker</span>
+                            )}
+                            <div className="vc-mentions-box-selected-sticker-copy">
+                                <span className="vc-mentions-box-selected-sticker-name">{selectedSticker.name}</span>
+                                <span className="vc-mentions-box-selected-sticker-hint">Sticker will be sent as a reply.</span>
+                            </div>
+                            <button
+                                className="vc-mentions-box-selected-sticker-remove"
+                                type="button"
+                                onClick={() => setSelectedSticker(null)}
+                            >
+                                Remove
+                            </button>
+                        </div>
+                    )}
                     <div className="vc-mentions-box-reply-input-wrap">
-                        {replyContent && (
+                        {replyContent && !replyInputFocused && (
                             <div className="vc-mentions-box-reply-rendered" aria-hidden>
                                 {renderMessageContent(replyContent, notice.channelId, notice.id)}
                             </div>
@@ -2844,18 +4019,21 @@ Right-click to delete this response`}
                         <textarea
                             ref={replyInputRef}
                             rows={1}
-                            className={`vc-mentions-box-reply-input${replyContent ? " vc-mentions-box-reply-input-rendered" : ""}`}
+                            className={`vc-mentions-box-reply-input${replyContent && !replyInputFocused ? " vc-mentions-box-reply-input-rendered" : ""}`}
                             value={replyContent}
                             onChange={handleReplyChange}
+                            onPaste={handleReplyPaste}
                             onSelect={handleReplySelect}
+                            onFocus={() => setReplyInputFocused(true)}
+                            onBlur={() => setReplyInputFocused(false)}
+                            onKeyDownCapture={handleReplyEscapeKeyDown}
                             onKeyDown={handleReplyKeyDown}
                             placeholder={`Reply to ${notice.authorName}`}
-                            disabled={isSendingReply}
                         />
                     </div>
                     <button
                         className="vc-mentions-box-reply-send"
-                        disabled={!replyContent.trim() || isSendingReply}
+                        disabled={replyDisabled}
                         type="submit"
                     >
                         Reply
@@ -2875,7 +4053,16 @@ function KeybindToast({ toast }: { toast: KeybindToastState; }) {
     );
 }
 
-function MentionsBox() {
+function MentionsBox({ embedded = false }: { embedded?: boolean; }) {
+    const rootRef = useRef<HTMLDivElement>(null);
+    const pendingFocusId = useRef<string | null>(null);
+    const pendingFocusReplyInput = useRef(false);
+    const pendingFocusAfterJump = useRef(false);
+    const [query, setQuery] = useState("");
+    const [filter, setFilter] = useState<MentionFilter>("all");
+    const [sourceFilter, setSourceFilter] = useState("all");
+    const [selectionMode, setSelectionMode] = useState(false);
+    const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
     const currentChannelId = useStateFromStores(
         [SelectedChannelStore],
         () => SelectedChannelStore.getChannelId(),
@@ -2883,29 +4070,299 @@ function MentionsBox() {
     );
     const currentNotices = useNotices();
     const notificationsHidden = useNotificationsHidden();
+    const sourceFilterVisible = useSourceFilterVisible();
     const currentKeybindToast = useKeybindToast();
     const unreadMentionsLoading = useUnreadMentionsLoading();
     const { sortOrder, visibleMentions } = settings.use(["sortOrder", "visibleMentions"]);
     const visibleLimit = Math.max(1, Math.floor(Number(visibleMentions) || 5));
-    const sortedNotices = useMemo(
-        () => sortOrder === SortOrder.Oldest ? [...currentNotices].reverse() : currentNotices,
-        [currentNotices, sortOrder]
-    );
+    const sourceOptions = useMemo<MentionSourceOption[]>(() => {
+        const bySource = new Map<string, MentionSourceOption>();
+
+        for (const notice of currentNotices) {
+            const value = notice.guildId ? `guild:${notice.guildId}` : `dm:${notice.channelId}`;
+            const existing = bySource.get(value);
+            if (existing) {
+                existing.count++;
+            } else {
+                bySource.set(value, {
+                    value,
+                    label: notice.guildId
+                        ? notice.guildName ?? GuildStore.getGuild(notice.guildId)?.name ?? "Unknown server"
+                        : `DM · ${notice.channelName}`,
+                    count: 1
+                });
+            }
+        }
+
+        return [
+            { value: "all", label: "All", count: currentNotices.length },
+            ...[...bySource.values()].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label))
+        ];
+    }, [currentNotices]);
+    const selectedSource = sourceOptions.find(option => option.value === sourceFilter) ?? sourceOptions[0];
+    const managedNotices = useMemo(() => {
+        const filtered = filterAndSortNotices(
+            currentNotices,
+            sortOrder,
+            embedded ? filter : "all",
+            embedded ? query : ""
+        );
+
+        if (embedded || !sourceFilterVisible || sourceFilter === "all") return filtered;
+        return filtered.filter(notice => sourceFilter === (notice.guildId ? `guild:${notice.guildId}` : `dm:${notice.channelId}`));
+    }, [currentNotices, embedded, filter, query, sortOrder, sourceFilter, sourceFilterVisible]);
     const visibleNotices = useMemo(
-        () => currentChannelId ? sortedNotices.slice(0, visibleLimit) : [],
-        [currentChannelId, sortedNotices, visibleLimit]
+        () => embedded
+            ? managedNotices
+            : currentChannelId ? managedNotices.slice(0, visibleLimit) : [],
+        [currentChannelId, embedded, managedNotices, visibleLimit]
     );
-    const queuedCount = currentChannelId
-        ? Math.max(currentNotices.length - visibleLimit, 0)
+    const queuedCount = !embedded && currentChannelId
+        ? Math.max(managedNotices.length - visibleLimit, 0)
         : 0;
+    const selectedNotices = useMemo(
+        () => currentNotices.filter(notice => selectedIds.has(notice.id)),
+        [currentNotices, selectedIds]
+    );
     const shouldShowMentions = !notificationsHidden;
-    const shouldRenderBox = Boolean(currentKeybindToast)
+    const shouldRenderBox = embedded
+        || Boolean(currentKeybindToast)
+        || (shouldShowMentions && sourceFilterVisible && currentNotices.length > 0)
         || (shouldShowMentions && (visibleNotices.length > 0 || unreadMentionsLoading.isLoading));
+
+    useEffect(() => {
+        if (!currentChannelId) return;
+
+        for (const notice of currentNotices) {
+            if (notice.kind === "typing" && notice.channelId === currentChannelId && !notice.externalReactionDismissStartedAt) {
+                startExternalReactionDismiss(notice.id, notice.channelId);
+            }
+        }
+    }, [currentChannelId, currentNotices]);
+
+    useEffect(() => {
+        const availableIds = new Set(currentNotices.map(notice => notice.id));
+        setSelectedIds(current => {
+            const next = new Set([...current].filter(id => availableIds.has(id)));
+            return next.size === current.size && [...next].every(id => current.has(id)) ? current : next;
+        });
+    }, [currentNotices]);
+
+    useEffect(() => {
+        if (sourceFilter !== "all" && !sourceOptions.some(option => option.value === sourceFilter)) setSourceFilter(sourceOptions[1]?.value ?? "all");
+    }, [sourceFilter, sourceOptions]);
+
+    useLayoutEffect(() => {
+        const focusId = pendingFocusId.current;
+        if (!focusId) return;
+
+        pendingFocusId.current = null;
+        const focusReplyInput = pendingFocusReplyInput.current;
+        pendingFocusReplyInput.current = false;
+        const focusAfterJump = pendingFocusAfterJump.current;
+        pendingFocusAfterJump.current = false;
+
+        const focusNextMention = () => {
+            const targets = rootRef.current?.querySelectorAll<HTMLElement>("[data-mention-id]");
+            const target = Array.from(targets ?? [])
+                .find(element => element.dataset.mentionId === focusId);
+            if (!target) return;
+
+            const focusTarget = focusReplyInput
+                ? target.querySelector<HTMLTextAreaElement>(".vc-mentions-box-reply-input")
+                : null;
+
+            if (focusTarget) {
+                focusTarget.focus({ preventScroll: true });
+                focusTarget.setSelectionRange(focusTarget.value.length, focusTarget.value.length);
+            } else {
+                target.focus({ preventScroll: true });
+            }
+            target.scrollIntoView({ block: "nearest" });
+        };
+
+        if (!focusAfterJump) {
+            focusNextMention();
+            return;
+        }
+
+        const timeout = window.setTimeout(focusNextMention, 350);
+        return () => window.clearTimeout(timeout);
+    }, [visibleNotices]);
 
     if (!shouldRenderBox) return null;
 
+    const handleNotice = (id: string, focusReplyInput = false, focusAfterJump = false) => {
+        pendingFocusId.current = getNextNoticeId(visibleNotices.map(notice => notice.id), id);
+        pendingFocusReplyInput.current = focusReplyInput;
+        pendingFocusAfterJump.current = focusAfterJump;
+    };
+
+    const toggleSelected = (id: string) => {
+        setSelectedIds(current => {
+            const next = new Set(current);
+            next.has(id) ? next.delete(id) : next.add(id);
+            return next;
+        });
+    };
+
+    const clearSelection = () => setSelectedIds(new Set());
+    const leaveSelectionMode = () => {
+        clearSelection();
+        setSelectionMode(false);
+    };
+
     return (
-        <div className="vc-mentions-box" role="region" aria-label="Recent mentions">
+        <div
+            ref={rootRef}
+            className={`vc-mentions-box${embedded ? " vc-mentions-box--embedded" : ""}`}
+            role="region"
+            aria-label="Recent mentions"
+        >
+            {!embedded && shouldShowMentions && sourceFilterVisible && currentNotices.length > 0 && (
+                <details
+                    className="vc-mentions-box-source-filter"
+                    onKeyDown={event => {
+                        if (event.key === "Escape") event.currentTarget.removeAttribute("open");
+                    }}
+                >
+                    <summary className="vc-mentions-box-source-filter-summary">
+                        <span className="vc-mentions-box-source-filter-label">Pings from</span>
+                        <span className="vc-mentions-box-source-filter-selected">{selectedSource.label}</span>
+                        <span
+                            className="vc-mentions-box-source-filter-count"
+                            aria-label={`${selectedSource.count} ping${selectedSource.count === 1 ? "" : "s"}`}
+                        >
+                            {selectedSource.count > 99 ? "99+" : selectedSource.count}
+                        </span>
+                        <span className="vc-mentions-box-source-filter-chevron" aria-hidden />
+                    </summary>
+                    <div className="vc-mentions-box-source-filter-menu" aria-label="Filter mentions by server or direct message">
+                        {sourceOptions.map(option => (
+                            <button
+                                key={option.value}
+                                className={`vc-mentions-box-source-filter-option${option.value === sourceFilter ? " vc-mentions-box-source-filter-option-active" : ""}`}
+                                type="button"
+                                aria-pressed={option.value === sourceFilter}
+                                onClick={event => {
+                                    setSourceFilter(option.value);
+                                    event.currentTarget.closest("details")?.removeAttribute("open");
+                                }}
+                            >
+                                <span>{option.label}</span>
+                                <span className="vc-mentions-box-source-filter-count">
+                                    {option.count > 99 ? "99+" : option.count}
+                                </span>
+                            </button>
+                        ))}
+                    </div>
+                </details>
+            )}
+            {embedded && (
+                <div className="vc-mentions-box-manager">
+                    <div className="vc-mentions-box-manager-primary">
+                        <div className="vc-mentions-box-manager-search-wrap">
+                            <svg viewBox="0 0 24 24" aria-hidden>
+                                <path fill="currentColor" d="m20.7 19.3-4.2-4.2a7 7 0 1 0-1.4 1.4l4.2 4.2a1 1 0 0 0 1.4-1.4ZM5 11a6 6 0 1 1 12 0 6 6 0 0 1-12 0Z" />
+                            </svg>
+                            <input
+                                className="vc-mentions-box-manager-search"
+                                value={query}
+                                onChange={event => setQuery(event.currentTarget.value)}
+                                placeholder="Search mentions"
+                                aria-label="Search mentions"
+                            />
+                        </div>
+                        <select
+                            className="vc-mentions-box-manager-select"
+                            value={filter}
+                            onChange={event => setFilter(event.currentTarget.value as MentionFilter)}
+                            aria-label="Filter mentions"
+                        >
+                            <option value="all">All mentions</option>
+                            <option value="servers">Servers</option>
+                            <option value="direct">Direct messages</option>
+                            <option value="bots">Bots</option>
+                        </select>
+                        <button
+                            className="vc-mentions-box-manager-button"
+                            type="button"
+                            onClick={() => { settings.store.sortOrder = sortOrder === SortOrder.Newest ? SortOrder.Oldest : SortOrder.Newest; }}
+                            title="Reverse mention order"
+                        >
+                            {sortOrder === SortOrder.Newest ? "Newest first" : "Oldest first"}
+                        </button>
+                    </div>
+                    <div className="vc-mentions-box-manager-actions">
+                        {selectionMode ? (
+                            <>
+                                <span className="vc-mentions-box-manager-count">{selectedIds.size} selected</span>
+                                <button
+                                    className="vc-mentions-box-manager-button"
+                                    type="button"
+                                    disabled={!visibleNotices.length}
+                                    onClick={() => setSelectedIds(new Set(visibleNotices.map(notice => notice.id)))}
+                                >
+                                    Select visible
+                                </button>
+                                <button
+                                    className="vc-mentions-box-manager-button vc-mentions-box-manager-button--danger"
+                                    type="button"
+                                    disabled={!selectedNotices.length}
+                                    onClick={() => {
+                                        removeNotices(selectedNotices);
+                                        leaveSelectionMode();
+                                    }}
+                                >
+                                    Clear selected
+                                </button>
+                                <button className="vc-mentions-box-manager-button" type="button" onClick={leaveSelectionMode}>
+                                    Cancel
+                                </button>
+                            </>
+                        ) : (
+                            <>
+                                <span className="vc-mentions-box-manager-count">
+                                    {visibleNotices.length === currentNotices.length
+                                        ? `${currentNotices.length} mention${currentNotices.length === 1 ? "" : "s"}`
+                                        : `${visibleNotices.length} of ${currentNotices.length}`}
+                                </span>
+                                <button
+                                    className="vc-mentions-box-manager-button"
+                                    type="button"
+                                    disabled={!visibleNotices.length}
+                                    onClick={() => setSelectionMode(true)}
+                                >
+                                    Select
+                                </button>
+                                <button
+                                    className="vc-mentions-box-manager-button"
+                                    type="button"
+                                    onClick={() => toggleNotificationsHidden()}
+                                >
+                                    {notificationsHidden ? "Show cards" : "Hide cards"}
+                                </button>
+                                <button
+                                    className="vc-mentions-box-manager-button"
+                                    type="button"
+                                    disabled={unreadMentionsLoading.isLoading}
+                                    onClick={() => scheduleUnreadMentionsLoad(0, true)}
+                                >
+                                    Refresh
+                                </button>
+                                <button
+                                    className="vc-mentions-box-manager-button vc-mentions-box-manager-button--danger"
+                                    type="button"
+                                    disabled={!currentNotices.length}
+                                    onClick={() => removeNotices(currentNotices)}
+                                >
+                                    Clear all
+                                </button>
+                            </>
+                        )}
+                    </div>
+                </div>
+            )}
             {currentKeybindToast && <KeybindToast toast={currentKeybindToast} />}
             {shouldShowMentions && unreadMentionsLoading.isLoading && (
                 <div className="vc-mentions-box-loading" role="status" aria-live="polite">
@@ -2913,9 +4370,38 @@ function MentionsBox() {
                     <span>{unreadMentionsLoading.label}</span>
                 </div>
             )}
-            {shouldShowMentions && visibleNotices.map(notice => (
-                <MentionCard key={notice.id} notice={notice} />
+            {shouldShowMentions && visibleNotices.map(notice => embedded ? (
+                <div
+                    key={notice.id}
+                    className={`vc-mentions-box-managed-card${selectionMode ? " vc-mentions-box-managed-card--selecting" : ""}${selectedIds.has(notice.id) ? " vc-mentions-box-managed-card--selected" : ""}`}
+                    data-mention-id={notice.id}
+                    tabIndex={-1}
+                >
+                    {selectionMode && (
+                        <button
+                            className="vc-mentions-box-selection-toggle"
+                            type="button"
+                            onClick={() => toggleSelected(notice.id)}
+                            aria-pressed={selectedIds.has(notice.id)}
+                            aria-label={`${selectedIds.has(notice.id) ? "Deselect" : "Select"} mention from ${notice.authorName}`}
+                        >
+                            {selectedIds.has(notice.id) ? "✓" : ""}
+                        </button>
+                    )}
+                    <MentionCard notice={notice} onHandled={handleNotice} />
+                </div>
+            ) : (
+                <MentionCard key={notice.id} notice={notice} onHandled={handleNotice} />
             ))}
+            {embedded && !unreadMentionsLoading.isLoading && (!shouldShowMentions || visibleNotices.length === 0) && (
+                <div className="vc-mentions-box-empty">
+                    {!shouldShowMentions
+                        ? "MentionsBox cards are currently hidden."
+                        : currentNotices.length
+                            ? "No mentions match the current filters."
+                            : "No recent mentions."}
+                </div>
+            )}
             {shouldShowMentions && queuedCount > 0 && (
                 <div className="vc-mentions-box-queued">
                     {queuedCount} more mention{queuedCount === 1 ? "" : "s"} queued
@@ -2924,6 +4410,47 @@ function MentionsBox() {
         </div>
     );
 }
+
+function MentionsBoxModal(props: RenderModalProps) {
+    return (
+        <Modal {...props} size="lg" title="MentionsBox">
+            <div className="vc-mentions-box-modal-content">
+                <MentionsBox embedded />
+            </div>
+        </Modal>
+    );
+}
+
+function MentionsSectionButton() {
+    const currentNotices = useNotices();
+    const count = currentNotices.length;
+
+    return (
+        <div className="vc-mentions-box-server-list-item">
+            <button
+                className="vc-mentions-box-server-list-button"
+                type="button"
+                onClick={() => openModal(props => <MentionsBoxModal {...props} />)}
+                aria-label={`Open MentionsBox${count ? `, ${count} recent mention${count === 1 ? "" : "s"}` : ""}`}
+                title="MentionsBox"
+            >
+                <svg viewBox="0 0 24 24" aria-hidden>
+                    <path
+                        fill="currentColor"
+                        d="M12 2a8 8 0 0 0-8 8v3.17L2.59 15.3A1 1 0 0 0 3.42 17H8a4 4 0 0 0 8 0h4.58a1 1 0 0 0 .83-1.7L20 13.17V10a8 8 0 0 0-8-8Zm0 18a2 2 0 0 1-1.73-1h3.46A2 2 0 0 1 12 20Zm-6.71-5 1.54-2.31A1 1 0 0 0 7 12.13V10a5 5 0 0 1 10 0v2.13a1 1 0 0 0 .17.56L18.71 15H5.29Z"
+                    />
+                </svg>
+                {count > 0 && (
+                    <span className="vc-mentions-box-server-list-badge">
+                        {count > 99 ? "99+" : count}
+                    </span>
+                )}
+            </button>
+        </div>
+    );
+}
+
+const renderMentionsSectionButton = ErrorBoundary.wrap(MentionsSectionButton, { noop: true });
 
 function mountRoot() {
     unmountRoot();
@@ -2946,11 +4473,25 @@ function unmountRoot() {
     document.getElementById(ROOT_ID)?.remove();
 }
 
+function applyDisplayLocation(location: DisplayLocation = settings.store.displayLocation) {
+    unmountRoot();
+    removeServerListElement(ServerListRenderPosition.Above, renderMentionsSectionButton);
+
+    if (!pluginStarted) return;
+
+    if (location === DisplayLocation.Channels) {
+        addServerListElement(ServerListRenderPosition.Above, renderMentionsSectionButton);
+    } else {
+        mountRoot();
+    }
+}
+
 export default definePlugin({
     name: "MentionsBox",
     description: "Shows clickable top-screen cards for recent mentions and jumps to the message when clicked.",
     tags: ["Chat", "Notifications"],
     authors: [Dean],
+    dependencies: ["ServerListAPI"],
     settings,
 
     toolboxActions() {
@@ -2983,13 +4524,16 @@ export default definePlugin({
     },
 
     start() {
-        mountRoot();
+        pluginStarted = true;
+        applyDisplayLocation();
         document.addEventListener("keydown", globalKeydownListener, true);
         pruneInterval = setInterval(clearExpiredNotices, 30_000);
+        void refreshKeywordNotifierMentionIds();
         scheduleUnreadMentionsLoad(1_500, true);
     },
 
     stop() {
+        pluginStarted = false;
         document.removeEventListener("keydown", globalKeydownListener, true);
         if (pruneInterval) clearInterval(pruneInterval);
         if (unreadLoadTimeout) clearTimeout(unreadLoadTimeout);
@@ -2998,10 +4542,13 @@ export default definePlugin({
         unreadLoadTimeout = null;
         keybindToastTimeout = null;
         keybindToast = null;
+        isSourceFilterVisible = false;
         dismissedNoticeIds.clear();
         preloadedNoticeContexts.clear();
+        sentReplyChains.clear();
         setUnreadMentionsLoading(false);
         setNotices([]);
+        removeServerListElement(ServerListRenderPosition.Above, renderMentionsSectionButton);
         unmountRoot();
     },
 
@@ -3038,11 +4585,27 @@ export default definePlugin({
             scheduleUnreadMentionsLoad(150, true);
         },
 
+        TYPING_START(payload: TypingStartPayload) {
+            const notice = buildNoticeFromTyping(payload);
+            if (notice) {
+                addNotice(notice);
+                if (SelectedChannelStore.getChannelId() === notice.channelId) startExternalReactionDismiss(notice.id, notice.channelId);
+            }
+        },
+
         MESSAGE_CREATE({ message, channelId, guildId }: MessageCreatePayload) {
             const currentUser = UserStore.getCurrentUser();
 
             if (message?.author?.id === currentUser?.id && removeNoticeForReply(message)) return;
+            if (shouldAutoReadBotMention(message)) {
+                const resolvedChannelId = message.channel_id ?? (message as any).channelId ?? channelId;
+                markMessageRead(resolvedChannelId, message.id);
+                dismissedNoticeIds.add(message.id);
+                removeNoticeForMessage(message.id, resolvedChannelId);
+                return;
+            }
             if (!message?.id || message.state === "SENDING" || !isRelevantMention(message)) return;
+            if (currentUser && messageMentionsUser(message, currentUser.id)) keywordNotifierMentionIds.add(message.id);
 
             const notice = buildNoticeFromMessage(message, channelId, guildId);
             if (notice) {
@@ -3053,6 +4616,23 @@ export default definePlugin({
 
                 addNotice(nextNotice);
                 preloadNoticeContext(nextNotice);
+                void hydrateNoticeReplyChain(nextNotice, message);
+            }
+        },
+
+        MESSAGE_UPDATE(payload: any) {
+            updateNoticeMedia(payload?.message ?? payload, payload?.channelId ?? payload?.channel_id);
+        },
+
+        MESSAGE_DELETE(payload: any) {
+            for (const messageId of getDeletedMessageIds(payload)) {
+                markNoticeDeleted(messageId, payload?.channelId ?? payload?.channel_id);
+            }
+        },
+
+        MESSAGE_DELETE_BULK(payload: any) {
+            for (const messageId of getDeletedMessageIds(payload)) {
+                markNoticeDeleted(messageId, payload?.channelId ?? payload?.channel_id);
             }
         },
 
@@ -3069,6 +4649,11 @@ export default definePlugin({
                 startExternalReactionDismiss(messageId, channelId);
             } else {
                 updateNoticeExternalReaction(messageId, channelId, (payload as any).emoji, 1);
+                const notice = buildNoticeFromReaction(payload);
+                if (notice) {
+                    addNotice(notice);
+                    preloadNoticeContext(notice);
+                }
             }
         },
 

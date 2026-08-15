@@ -25,6 +25,7 @@ export interface ReplyPlaceholderMatch {
 export const REPLY_PLACEHOLDERS: ReplyPlaceholderDefinition[] = [
     { key: "author.name", label: "Author name", description: "Best available name for the person who mentioned you" },
     { key: "author.nickname", label: "Author nickname", description: "Their server/DM nickname when Discord provides one" },
+    { key: "author.servernickname", label: "Server nickname", description: "Their nickname in this server when available" },
     { key: "author.displayname", label: "Author display name", description: "Their profile display name" },
     { key: "author.username", label: "Author username", description: "Their Discord username" },
     { key: "author.id", label: "Author ID", description: "Their Discord user ID" },
@@ -38,12 +39,14 @@ export const REPLY_PLACEHOLDERS: ReplyPlaceholderDefinition[] = [
     { key: "reply.author.name", label: "Replied author", description: "The author of the replied-to message, when available" },
     { key: "me.name", label: "Your name", description: "Your best available name" },
     { key: "me.nickname", label: "Your nickname", description: "Your nickname when Discord provides one" },
+    { key: "me.servernickname", label: "Your server nickname", description: "Your nickname in this server when available" },
     { key: "me.displayname", label: "Your display name", description: "Your profile display name" },
     { key: "me.username", label: "Your username", description: "Your Discord username" },
     { key: "me.id", label: "Your ID", description: "Your Discord user ID" }
 ];
 
 export const PLACEHOLDER_HELP = REPLY_PLACEHOLDERS.map(placeholder => `{${placeholder.key}}`);
+const PLACEHOLDERS_BY_KEY = new Map(REPLY_PLACEHOLDERS.map(placeholder => [placeholder.key, placeholder]));
 
 function formatPlaceholderPreview(value: string) {
     const preview = value.replace(/\s+/g, " ").trim();
@@ -73,10 +76,13 @@ export function getReplyPlaceholderMatch(content: string, cursorPos: number): Re
     return null;
 }
 
-export function getReplyPlaceholderSuggestions(replacements: Record<string, string>, query: string): ReplyPlaceholderSuggestion[] {
+export function getReplyPlaceholderSuggestions(replacements: Record<string, string>, query: string, orderedKeys?: string[]): ReplyPlaceholderSuggestion[] {
     const normalizedQuery = query.trim().toLowerCase();
+    const placeholders = orderedKeys
+        ? orderedKeys.map(key => PLACEHOLDERS_BY_KEY.get(key)).filter(Boolean) as ReplyPlaceholderDefinition[]
+        : REPLY_PLACEHOLDERS;
 
-    return REPLY_PLACEHOLDERS
+    return placeholders
         .map(placeholder => {
             const resolvedValue = replacements[placeholder.key] ?? "";
 
