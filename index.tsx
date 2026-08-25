@@ -54,6 +54,7 @@ import {
     getReplyPlaceholderSuggestions,
     PLACEHOLDER_HELP,
     REPLY_PLACEHOLDERS,
+    type ReplyPlaceholderMatch,
     type ReplyPlaceholderSuggestion,
     resolveReplyPlaceholders
 } from "./placeholders";
@@ -2976,6 +2977,8 @@ function ReplyMediaPreview({ file, onRemove }: { file: File; onRemove(): void; }
     );
 }
 
+const EMOJI_AUTOCOMPLETE_ID = "vc-mentions-box-emoji-autocomplete";
+
 interface ReplyAutocompleteLayerProps {
     inputRef: React.RefObject<HTMLTextAreaElement | null>;
     replyContent: string;
@@ -3047,15 +3050,20 @@ function ReplyAutocompleteLayer({
 
     return ReactDOM.createPortal(
         <div
+            id={EMOJI_AUTOCOMPLETE_ID}
             className="vc-mentions-box-autocomplete"
+            role="listbox"
+            aria-label="Emoji suggestions"
             style={{ left: position.left, top: position.top, width: position.width }}
         >
             {emojiSuggestions.map((emoji, idx) => {
                 const imgUrl = getEmojiImageUrl(emoji);
                 return (
                     <button
+                        id={`${EMOJI_AUTOCOMPLETE_ID}-${idx}`}
                         key={getEmojiKey(emoji)}
                         type="button"
+                        role="option"
                         className={`vc-mentions-box-autocomplete-item${idx === selectedIndex ? " vc-mentions-box-autocomplete-item--active" : ""}`}
                         onMouseDown={event => {
                             event.preventDefault();
@@ -4070,11 +4078,13 @@ Right-click to delete this response`}
                             onKeyDownCapture={handleReplyEscapeKeyDown}
                             onKeyDown={handleReplyKeyDown}
                             aria-autocomplete="list"
-                            aria-controls={PLACEHOLDER_AUTOCOMPLETE_ID}
+                            aria-controls={placeholderMatch
+                                ? PLACEHOLDER_AUTOCOMPLETE_ID
+                                : autocompleteSuggestions.length > 0 ? EMOJI_AUTOCOMPLETE_ID : undefined}
                             aria-expanded={Boolean(placeholderMatch || autocompleteSuggestions.length > 0)}
-                            aria-activedescendant={autocompleteSuggestions[autocompleteIndex]
-                                ? getPlaceholderAutocompleteOptionId(autocompleteSuggestions[autocompleteIndex].key)
-                                : undefined}
+                            aria-activedescendant={placeholderMatch && placeholderSuggestions[autocompleteIndex]
+                                ? getPlaceholderAutocompleteOptionId(placeholderSuggestions[autocompleteIndex].key)
+                                : autocompleteSuggestions[autocompleteIndex] ? `${EMOJI_AUTOCOMPLETE_ID}-${autocompleteIndex}` : undefined}
                             placeholder={`Reply to ${notice.authorName}`}
                         />
                     </div>
