@@ -48,7 +48,7 @@ import {
 } from "@webpack/common";
 
 import { filterAndSortNotices, getNextNoticeId, type MentionFilter } from "./manager";
-import { PlaceholderAutocomplete, type ReplyAutocompletePosition } from "./PlaceholderAutocomplete";
+import { getPlaceholderAutocompleteOptionId, PLACEHOLDER_AUTOCOMPLETE_ID, PlaceholderAutocomplete, type ReplyAutocompletePosition } from "./PlaceholderAutocomplete";
 import {
     getReplyPlaceholderMatch,
     getReplyPlaceholderSuggestions,
@@ -538,6 +538,11 @@ async function refreshKeywordNotifierMentionIds() {
 }
 
 const listeners = new Set<() => void>();
+const notificationVisibilityListeners = new Set<() => void>();
+const sourceFilterVisibilityListeners = new Set<() => void>();
+const keybindToastListeners = new Set<() => void>();
+const unreadMentionsLoadingListeners = new Set<() => void>();
+const interactionSearchListeners = new Set<() => void>();
 const mentionBoxReactionMessageIds = new Set<string>();
 const dismissedNoticeIds = new Set<string>();
 const preloadedNoticeContexts = new Set<string>();
@@ -545,14 +550,14 @@ const pendingReplyNoticeRemovalIds = new Set<string>();
 const sentReplyChains = new Map<string, ReplyPreview[]>();
 let sharedInteractionSearch = "";
 
-function emitChange() {
-    for (const listener of listeners) listener();
+function emitChange(target = listeners) {
+    for (const listener of target) listener();
 }
 
-function subscribe(listener: () => void) {
-    listeners.add(listener);
+function subscribe(target: Set<() => void>, listener: () => void) {
+    target.add(listener);
     return () => {
-        listeners.delete(listener);
+        target.delete(listener);
     };
 }
 
@@ -561,6 +566,7 @@ function getSnapshot() {
 }
 
 function setNotices(nextNotices: MentionNotice[]) {
+    if (notices === nextNotices) return;
     notices = nextNotices;
     emitChange();
 }
@@ -569,14 +575,14 @@ function setNotificationsHidden(isHidden: boolean) {
     if (areNotificationsHidden === isHidden) return;
 
     areNotificationsHidden = isHidden;
-    emitChange();
+    emitChange(notificationVisibilityListeners);
 }
 
 function setSharedInteractionSearch(value: string) {
     if (sharedInteractionSearch === value) return;
 
     sharedInteractionSearch = value;
-    emitChange();
+    emitChange(interactionSearchListeners);
 }
 
 interface KeybindToastState {
@@ -591,12 +597,12 @@ function showKeybindSettingToast(message: string) {
         id: ++keybindToastId,
         message
     };
-    emitChange();
+    emitChange(keybindToastListeners);
 
     keybindToastTimeout = setTimeout(() => {
         keybindToast = null;
         keybindToastTimeout = null;
-        emitChange();
+        emitChange(keybindToastListeners);
     }, 1700);
 }
 
@@ -632,7 +638,7 @@ function setUnreadMentionsLoading(isLoading: boolean, label = unreadMentionsLoad
 
     isLoadingUnreadMentions = isLoading;
     unreadMentionsLoadingLabel = label;
-    emitChange();
+    emitChange(unreadMentionsLoadingListeners);
 }
 
 function sortNoticesNewestFirst(nextNotices: MentionNotice[]) {
@@ -647,7 +653,7 @@ function removeNotice(id: string) {
 
 function toggleSourceFilter() {
     isSourceFilterVisible = !isSourceFilterVisible;
-    emitChange();
+    emitChange(sourceFilterVisibilityListeners);
 }
 
 function toggleJumpOnReply(showToast = false) {
@@ -2388,7 +2394,7 @@ const globalKeydownListener = (event: KeyboardEvent) => {
 function useNotices() {
     const [currentNotices, setCurrentNotices] = useState(getSnapshot);
 
-    useEffect(() => subscribe(() => setCurrentNotices([...getSnapshot()])), []);
+    useEffect(() => subscribe(listeners, () => setCurrentNotices(getSnapshot())), []);
 
     return currentNotices;
 }
@@ -2396,7 +2402,7 @@ function useNotices() {
 function useNotificationsHidden() {
     const [isHidden, setIsHidden] = useState(areNotificationsHidden);
 
-    useEffect(() => subscribe(() => setIsHidden(areNotificationsHidden)), []);
+    useEffect(() => subscribe(notificationVisibilityListeners, () => setIsHidden(areNotificationsHidden)), []);
 
     return isHidden;
 }
@@ -2404,7 +2410,7 @@ function useNotificationsHidden() {
 function useSourceFilterVisible() {
     const [isVisible, setIsVisible] = useState(isSourceFilterVisible);
 
-    useEffect(() => subscribe(() => setIsVisible(isSourceFilterVisible)), []);
+    useEffect(() => subscribe(sourceFilterVisibilityListeners, () => setIsVisible(isSourceFilterVisible)), []);
 
     return isVisible;
 }
@@ -2412,7 +2418,7 @@ function useSourceFilterVisible() {
 function useKeybindToast() {
     const [toast, setToast] = useState(keybindToast);
 
-    useEffect(() => subscribe(() => setToast(keybindToast)), []);
+    useEffect(() => subscribe(keybindToastListeners, () => setToast(keybindToast)), []);
 
     return toast;
 }
@@ -2423,7 +2429,7 @@ function useUnreadMentionsLoading() {
         label: unreadMentionsLoadingLabel
     });
 
-    useEffect(() => subscribe(() => setLoadingState({
+    useEffect(() => subscribe(unreadMentionsLoadingListeners, () => setLoadingState({
         isLoading: isLoadingUnreadMentions,
         label: unreadMentionsLoadingLabel
     })), []);
@@ -2970,6 +2976,152 @@ function ReplyMediaPreview({ file, onRemove }: { file: File; onRemove(): void; }
     );
 }
 
+interface ReplyAutocompleteLayerProps {
+    inputRef: React.RefObject<HTMLTextAreaElement | null>;
+    replyContent: string;
+    placeholderMatch: ReplyPlaceholderMatch | null;
+    placeholderSuggestions: ReplyPlaceholderSuggestion[];
+    emojiSuggestions: Emoji[];
+    selectedIndex: number;
+    onSelectPlaceholder(placeholder: ReplyPlaceholderSuggestion, mode: "value" | "token"): void;
+    onSelectEmoji(emoji: Emoji): void;
+}
+
+function ReplyAutocompleteLayer({
+    inputRef,
+    replyContent,
+    placeholderMatch,
+    placeholderSuggestions,
+    emojiSuggestions,
+    selectedIndex,
+    onSelectPlaceholder,
+    onSelectEmoji
+}: ReplyAutocompleteLayerProps) {
+    const [position, setPosition] = useState<ReplyAutocompletePosition | null>(null);
+
+    useLayoutEffect(() => {
+        let animationFrame = 0;
+
+        function updatePosition() {
+            const input = inputRef.current;
+            if (!input) return;
+
+            const rect = input.getBoundingClientRect();
+            const width = Math.min(420, Math.max(320, rect.width));
+            const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8);
+            setPosition({ left, top: rect.bottom + 4, width });
+        }
+
+        function schedulePositionUpdate() {
+            if (animationFrame) return;
+            animationFrame = requestAnimationFrame(() => {
+                animationFrame = 0;
+                updatePosition();
+            });
+        }
+
+        schedulePositionUpdate();
+        window.addEventListener("resize", schedulePositionUpdate);
+        window.addEventListener("scroll", schedulePositionUpdate, true);
+
+        return () => {
+            cancelAnimationFrame(animationFrame);
+            window.removeEventListener("resize", schedulePositionUpdate);
+            window.removeEventListener("scroll", schedulePositionUpdate, true);
+        };
+    }, [inputRef, replyContent]);
+
+    if (placeholderMatch) {
+        return (
+            <PlaceholderAutocomplete
+                position={position}
+                query={placeholderMatch.query}
+                suggestions={placeholderSuggestions}
+                selectedIndex={selectedIndex}
+                onSelect={onSelectPlaceholder}
+            />
+        );
+    }
+
+    if (!position || emojiSuggestions.length === 0) return null;
+
+    return ReactDOM.createPortal(
+        <div
+            className="vc-mentions-box-autocomplete"
+            style={{ left: position.left, top: position.top, width: position.width }}
+        >
+            {emojiSuggestions.map((emoji, idx) => {
+                const imgUrl = getEmojiImageUrl(emoji);
+                return (
+                    <button
+                        key={getEmojiKey(emoji)}
+                        type="button"
+                        className={`vc-mentions-box-autocomplete-item${idx === selectedIndex ? " vc-mentions-box-autocomplete-item--active" : ""}`}
+                        onMouseDown={event => {
+                            event.preventDefault();
+                            onSelectEmoji(emoji);
+                        }}
+                        aria-selected={idx === selectedIndex}
+                    >
+                        {imgUrl
+                            ? <img className="vc-mentions-box-autocomplete-img" src={imgUrl} alt="" />
+                            : <span className="vc-mentions-box-emoji-unicode">{getUnicodeEmojiSurrogates(emoji)}</span>
+                        }
+                        <span className="vc-mentions-box-autocomplete-name">{getEmojiLabel(emoji)}</span>
+                    </button>
+                );
+            })}
+        </div>,
+        document.body
+    );
+}
+
+function ExternalReactionExpiry({ noticeId, durationMs, paused }: { noticeId: string; durationMs: number; paused: boolean; }) {
+    const [progress, setProgress] = useState(0);
+
+    useEffect(() => {
+        let animationFrame = 0;
+        let currentProgress = 0;
+        let lastTick = performance.now();
+
+        const tick = (now: number) => {
+            if (paused) {
+                if (currentProgress !== 0) {
+                    currentProgress = 0;
+                    setProgress(0);
+                }
+
+                lastTick = now;
+                animationFrame = requestAnimationFrame(tick);
+                return;
+            }
+
+            currentProgress = Math.min(1, currentProgress + (now - lastTick) / durationMs);
+            lastTick = now;
+            setProgress(currentProgress);
+
+            if (currentProgress >= 1) {
+                removeNotice(noticeId);
+                return;
+            }
+
+            animationFrame = requestAnimationFrame(tick);
+        };
+
+        setProgress(0);
+        animationFrame = requestAnimationFrame(tick);
+        return () => cancelAnimationFrame(animationFrame);
+    }, [durationMs, noticeId, paused]);
+
+    return (
+        <div
+            className="vc-mentions-box-expire-bar"
+            style={{ transform: `scaleX(${progress})` }}
+            aria-hidden
+        />
+    );
+}
+
 function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?: (id: string, focusReplyInput?: boolean, focusAfterJump?: boolean) => void; }) {
     const [replyContent, setReplyContent] = useState("");
     const [isExpanded, setIsExpanded] = useState(() => settings.store.autoExpandReadMore);
@@ -2978,7 +3130,6 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     const [isHovered, setIsHovered] = useState(false);
     const [isFocusedWithin, setIsFocusedWithin] = useState(false);
     const [replyInputFocused, setReplyInputFocused] = useState(false);
-    const [externalReactionDismissProgress, setExternalReactionDismissProgress] = useState(0);
     const [interactionSearch, setInteractionSearchRaw] = useState(
         () => settings.store.persistInteractionSearch ? sharedInteractionSearch : ""
     );
@@ -2993,7 +3144,6 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     const [contentOverflows, setContentOverflows] = useState(false);
     const [pickerPos, setPickerPos] = useState<{ bottom: number; right: number; } | null>(null);
     const [stickerPickerPos, setStickerPickerPos] = useState<{ bottom: number; right: number; } | null>(null);
-    const [autocompletePosition, setAutocompletePosition] = useState<ReplyAutocompletePosition | null>(null);
     const replyInputRef = useRef<HTMLTextAreaElement>(null);
     const emojiPickerRef = useRef<HTMLDivElement>(null);
     const pickerTriggerRef = useRef<HTMLButtonElement>(null);
@@ -3071,43 +3221,11 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         if (autoExpandReadMore) setIsExpanded(true);
     }, [autoExpandReadMore]);
     useEffect(() => { setAutocompleteIndex(0); }, [autocompleteSuggestions.length, placeholderSuggestions.length]);
-    useLayoutEffect(() => {
-        const shouldShowAutocomplete = Boolean(placeholderMatch) || autocompleteSuggestions.length > 0;
-        if (!shouldShowAutocomplete) {
-            setAutocompletePosition(null);
-            return;
-        }
-
-        function updateAutocompletePosition() {
-            const input = replyInputRef.current;
-            if (!input) return;
-
-            const rect = input.getBoundingClientRect();
-            const width = Math.min(420, Math.max(320, rect.width));
-            const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8);
-
-            setAutocompletePosition({
-                left,
-                top: rect.bottom + 4,
-                width
-            });
-        }
-
-        updateAutocompletePosition();
-
-        window.addEventListener("resize", updateAutocompletePosition);
-        window.addEventListener("scroll", updateAutocompletePosition, true);
-
-        return () => {
-            window.removeEventListener("resize", updateAutocompletePosition);
-            window.removeEventListener("scroll", updateAutocompletePosition, true);
-        };
-    }, [placeholderMatch, autocompleteSuggestions.length, replyContent]);
     useEffect(() => {
         if (!persistInteractionSearch) return;
 
         setInteractionSearchRaw(sharedInteractionSearch);
-        return subscribe(() => setInteractionSearchRaw(sharedInteractionSearch));
+        return subscribe(interactionSearchListeners, () => setInteractionSearchRaw(sharedInteractionSearch));
     }, [persistInteractionSearch]);
     useEffect(() => {
         if (persistInteractionSearch) return;
@@ -3138,53 +3256,6 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         document.addEventListener("mousedown", handleClick);
         return () => document.removeEventListener("mousedown", handleClick);
     }, [showEmojiPicker, showStickerPicker]);
-
-    useEffect(() => {
-        if (!isExternalReactionDismissing || !notice.externalReactionDismissDurationMs) {
-            setExternalReactionDismissProgress(0);
-            return;
-        }
-
-        let animationFrame = 0;
-        let progress = 0;
-        let lastTick = performance.now();
-
-        setExternalReactionDismissProgress(0);
-
-        const tick = (now: number) => {
-            if (isExternalReactionDismissPaused) {
-                if (progress !== 0) {
-                    progress = 0;
-                    setExternalReactionDismissProgress(0);
-                }
-
-                lastTick = now;
-                animationFrame = requestAnimationFrame(tick);
-                return;
-            }
-
-            progress = Math.min(1, progress + (now - lastTick) / notice.externalReactionDismissDurationMs!);
-            lastTick = now;
-            setExternalReactionDismissProgress(progress);
-
-            if (progress >= 1) {
-                removeNotice(notice.id);
-                return;
-            }
-
-            animationFrame = requestAnimationFrame(tick);
-        };
-
-        animationFrame = requestAnimationFrame(tick);
-
-        return () => cancelAnimationFrame(animationFrame);
-    }, [
-        isExternalReactionDismissing,
-        isExternalReactionDismissPaused,
-        notice.externalReactionDismissDurationMs,
-        notice.externalReactionDismissStartedAt,
-        notice.id
-    ]);
 
     const quickReactionEmojis = useMemo(
         () => getQuickReactionEmojis(notice.guildId),
@@ -3631,11 +3702,11 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
             onBlurCapture={handleCardBlurCapture}
             onKeyDownCapture={handleCardKeyDownCapture}
         >
-            {isExternalReactionDismissing && (
-                <div
-                    className="vc-mentions-box-expire-bar"
-                    style={{ transform: `scaleX(${externalReactionDismissProgress})` }}
-                    aria-hidden
+            {isExternalReactionDismissing && notice.externalReactionDismissDurationMs && (
+                <ExternalReactionExpiry
+                    noticeId={notice.id}
+                    durationMs={notice.externalReactionDismissDurationMs}
+                    paused={isExternalReactionDismissPaused}
                 />
             )}
             <div className="vc-mentions-box-accent" />
@@ -3933,47 +4004,17 @@ Right-click to delete this response`}
                     </div>
                 </div>
                 <form className="vc-mentions-box-reply" onSubmit={submitReply} onClick={event => event.stopPropagation()}>
-                    {placeholderMatch && (
-                        <PlaceholderAutocomplete
-                            position={autocompletePosition}
-                            query={placeholderMatch.query}
-                            suggestions={placeholderSuggestions}
+                    {(placeholderMatch || autocompleteSuggestions.length > 0) && (
+                        <ReplyAutocompleteLayer
+                            inputRef={replyInputRef}
+                            replyContent={replyContent}
+                            placeholderMatch={placeholderMatch}
+                            placeholderSuggestions={placeholderSuggestions}
+                            emojiSuggestions={autocompleteSuggestions}
                             selectedIndex={autocompleteIndex}
-                            onSelect={insertAutocompletedPlaceholder}
+                            onSelectPlaceholder={insertAutocompletedPlaceholder}
+                            onSelectEmoji={insertAutocompletedEmoji}
                         />
-                    )}
-                    {!placeholderMatch && autocompletePosition && autocompleteSuggestions.length > 0 && ReactDOM.createPortal(
-                        <div
-                            className="vc-mentions-box-autocomplete"
-                            style={{
-                                left: autocompletePosition.left,
-                                top: autocompletePosition.top,
-                                width: autocompletePosition.width
-                            }}
-                        >
-                            {autocompleteSuggestions.map((emoji, idx) => {
-                                const imgUrl = getEmojiImageUrl(emoji);
-                                return (
-                                    <button
-                                        key={getEmojiKey(emoji)}
-                                        type="button"
-                                        className={`vc-mentions-box-autocomplete-item${idx === autocompleteIndex ? " vc-mentions-box-autocomplete-item--active" : ""}`}
-                                        onMouseDown={e => {
-                                            e.preventDefault();
-                                            insertAutocompletedEmoji(emoji);
-                                        }}
-                                        aria-selected={idx === autocompleteIndex}
-                                    >
-                                        {imgUrl
-                                            ? <img className="vc-mentions-box-autocomplete-img" src={imgUrl} alt="" />
-                                            : <span className="vc-mentions-box-emoji-unicode">{getUnicodeEmojiSurrogates(emoji)}</span>
-                                        }
-                                        <span className="vc-mentions-box-autocomplete-name">{getEmojiLabel(emoji)}</span>
-                                    </button>
-                                );
-                            })}
-                        </div>,
-                        document.body
                     )}
                     {replyFiles.length > 0 && (
                         <div className="vc-mentions-box-reply-media-list">
@@ -4028,6 +4069,12 @@ Right-click to delete this response`}
                             onBlur={() => setReplyInputFocused(false)}
                             onKeyDownCapture={handleReplyEscapeKeyDown}
                             onKeyDown={handleReplyKeyDown}
+                            aria-autocomplete="list"
+                            aria-controls={PLACEHOLDER_AUTOCOMPLETE_ID}
+                            aria-expanded={Boolean(placeholderMatch || autocompleteSuggestions.length > 0)}
+                            aria-activedescendant={autocompleteSuggestions[autocompleteIndex]
+                                ? getPlaceholderAutocompleteOptionId(autocompleteSuggestions[autocompleteIndex].key)
+                                : undefined}
                             placeholder={`Reply to ${notice.authorName}`}
                         />
                     </div>
@@ -4543,9 +4590,13 @@ export default definePlugin({
         keybindToastTimeout = null;
         keybindToast = null;
         isSourceFilterVisible = false;
+        sharedInteractionSearch = "";
         dismissedNoticeIds.clear();
         preloadedNoticeContexts.clear();
+        pendingReplyNoticeRemovalIds.clear();
         sentReplyChains.clear();
+        mentionBoxReactionMessageIds.clear();
+        keywordNotifierMentionIds.clear();
         setUnreadMentionsLoading(false);
         setNotices([]);
         removeServerListElement(ServerListRenderPosition.Above, renderMentionsSectionButton);

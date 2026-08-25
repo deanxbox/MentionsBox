@@ -26,26 +26,25 @@ export function filterAndSortNotices<T extends ManageableMention>(
 ): T[] {
     const terms = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
 
-    return notices
-        .filter(notice => {
-            if (filter === "servers" && !notice.guildId) return false;
-            if (filter === "direct" && notice.guildId) return false;
-            if (filter === "bots" && !notice.authorBot) return false;
+    const filtered = notices.filter(notice => {
+        if (filter === "servers" && !notice.guildId) return false;
+        if (filter === "direct" && notice.guildId) return false;
+        if (filter === "bots" && !notice.authorBot) return false;
 
-            if (!terms.length) return true;
+        if (!terms.length) return true;
 
-            const haystack = [
-                notice.authorName,
-                notice.guildName ?? "",
-                notice.channelName,
-                notice.content
-            ].join(" ").toLocaleLowerCase();
+        const haystack = [
+            notice.authorName,
+            notice.guildName ?? "",
+            notice.channelName,
+            notice.content
+        ].join(" ").toLocaleLowerCase();
 
-            return terms.every(term => haystack.includes(term));
-        })
-        .sort((a, b) => sortOrder === "oldest"
-            ? a.timestamp - b.timestamp
-            : b.timestamp - a.timestamp);
+        return terms.every(term => haystack.includes(term));
+    });
+
+    if (sortOrder === "newest") return filtered;
+    return filtered.reverse();
 }
 
 export function getNextNoticeId(noticeIds: readonly string[], handledId: string): string | null {

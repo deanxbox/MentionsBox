@@ -14,6 +14,12 @@ export interface ReplyAutocompletePosition {
     width: number;
 }
 
+export const PLACEHOLDER_AUTOCOMPLETE_ID = "vc-mentions-box-placeholder-autocomplete";
+
+export function getPlaceholderAutocompleteOptionId(key: string) {
+    return `${PLACEHOLDER_AUTOCOMPLETE_ID}-${key.replaceAll(".", "-")}`;
+}
+
 interface PlaceholderAutocompleteProps {
     position: ReplyAutocompletePosition | null;
     query: string;
@@ -39,7 +45,10 @@ export function PlaceholderAutocomplete({
 
     return ReactDOM.createPortal(
         <div
+            id={PLACEHOLDER_AUTOCOMPLETE_ID}
             className="vc-mentions-box-autocomplete vc-mentions-box-placeholder-autocomplete"
+            role="listbox"
+            aria-label="Reply placeholders"
             style={{
                 left: position.left,
                 top: position.top,
@@ -50,11 +59,13 @@ export function PlaceholderAutocomplete({
                 <>
                     {suggestions.map((placeholder, idx) => (
                         <button
+                            id={getPlaceholderAutocompleteOptionId(placeholder.key)}
                             key={placeholder.key}
                             ref={element => {
                                 itemRefs.current[idx] = element;
                             }}
                             type="button"
+                            role="option"
                             className={`vc-mentions-box-autocomplete-item vc-mentions-box-placeholder-item${idx === selectedIndex ? " vc-mentions-box-autocomplete-item--active" : ""}`}
                             onMouseDown={e => {
                                 e.preventDefault();
