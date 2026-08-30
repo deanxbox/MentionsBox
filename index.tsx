@@ -13,7 +13,7 @@ import ErrorBoundary from "@components/ErrorBoundary";
 import definePlugin, { OptionType, type PluginAuthor } from "@utils/types";
 import type { CloudUpload as TCloudUpload, Emoji, MessageJSON, RenderModalProps, Sticker } from "@vencord/discord-types";
 import { ChannelType, CloudUploadPlatform, MessageType, StickerFormatType } from "@vencord/discord-types/enums";
-import { findByPropsLazy, findLazy } from "@webpack";
+import { findByPropsLazy, findCssClassesLazy, findLazy } from "@webpack";
 import {
     ChannelStore,
     Constants,
@@ -140,6 +140,7 @@ interface MentionNotice {
     channelName: string;
     guildName?: string;
     content: string;
+    originalContent?: string;
     referencedContent?: string;
     referencedAuthorName?: string;
     replyChain: ReplyPreview[];
@@ -217,6 +218,7 @@ const DEFAULT_PRESELECTED_DIALOGUES: PreselectedDialogue[] = [
 
 const EmojiUtils = findByPropsLazy("getURL", "getEmojiColors");
 const CloudUpload: typeof TCloudUpload = findLazy(module => module.prototype?.trackUploadFinished);
+const MessageClasses = findCssClassesLazy("edited", "communicationDisabled", "isSystemMessage");
 
 const enum SortOrder {
     Newest = "newest",
@@ -1341,13 +1343,14 @@ function collectMessageMedia(...messages: any[]): MessageMediaPreview[] {
     return media;
 }
 
-function updateNoticeMedia(message: any, fallbackChannelId?: string) {
+function updateNoticeMessage(message: any, fallbackChannelId?: string) {
     const messageId = message?.id ?? message?.message_id ?? message?.messageId;
     const channelId = message?.channel_id ?? message?.channelId ?? fallbackChannelId;
     if (!messageId || !channelId || !notices.some(notice => notice.id === messageId && notice.channelId === channelId)) return;
 
+    const content = typeof message.content === "string" ? formatContent(message) : undefined;
     const freshMedia = collectMessageMedia(message, MessageStore.getMessage(channelId, messageId));
-    if (!freshMedia.length) return;
+    if (content === undefined && !freshMedia.length) return;
 
     setNotices(notices.map(notice => {
         if (notice.id !== messageId || notice.channelId !== channelId) return notice;
@@ -1355,7 +1358,15 @@ function updateNoticeMedia(message: any, fallbackChannelId?: string) {
         const media = [...notice.media, ...freshMedia].filter((item, index, items) =>
             items.findIndex(candidate => candidate.url === item.url) === index
         );
-        return { ...notice, media };
+        const contentChanged = content !== undefined && content !== notice.content;
+        return {
+            ...notice,
+            ...(contentChanged ? {
+                content,
+                originalContent: notice.originalContent ?? notice.content
+            } : {}),
+            media
+        };
     }));
 }
 
@@ -3150,8 +3161,10 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     const [selectedSticker, setSelectedSticker] = useState<SelectedReplySticker>(null);
     const [replyFiles, setReplyFiles] = useState<File[]>([]);
     const [contentOverflows, setContentOverflows] = useState(false);
+    const [interactionNavIndex, setInteractionNavIndex] = useState<number | null>(null);
     const [pickerPos, setPickerPos] = useState<{ bottom: number; right: number; } | null>(null);
     const [stickerPickerPos, setStickerPickerPos] = useState<{ bottom: number; right: number; } | null>(null);
+    const cardRef = useRef<HTMLDivElement>(null);
     const replyInputRef = useRef<HTMLTextAreaElement>(null);
     const emojiPickerRef = useRef<HTMLDivElement>(null);
     const pickerTriggerRef = useRef<HTMLButtonElement>(null);
@@ -3592,6 +3605,20 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         });
     }, [cursorPos, pushReplyHistory, replyContent]);
 
+    const getInteractionActions = useCallback(() =>
+        Array.from(cardRef.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [])
+            .filter(button => button.offsetParent !== null), []);
+
+    const focusInteractionAction = useCallback((index: number) => {
+        const actions = getInteractionActions();
+        if (!actions.length) return;
+
+        const nextIndex = (index + actions.length) % actions.length;
+        setInteractionNavIndex(nextIndex);
+        actions[nextIndex].focus({ preventScroll: true });
+        actions[nextIndex].scrollIntoView({ block: "nearest", inline: "nearest" });
+    }, [getInteractionActions]);
+
     const handleReplyEscapeKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
         if (event.key !== "Escape") return false;
 
@@ -3604,6 +3631,14 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
 
     const handleReplyKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
         if (handleReplyEscapeKeyDown(event)) return;
+        if ((event.ctrlKey || event.metaKey) && event.key === "Tab") {
+            event.preventDefault();
+            event.stopPropagation();
+            event.nativeEvent.stopImmediatePropagation?.();
+            focusInteractionAction(event.shiftKey ? -1 : 0);
+            return;
+        }
+
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z" && !event.shiftKey && undoReplyEdit()) {
             event.preventDefault();
             event.stopPropagation();
@@ -3613,6 +3648,11 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
             event.stopPropagation();
+            if (!replyContent.trim() && !selectedSticker && replyFiles.length === 0) {
+                jumpToNotice(notice);
+                return;
+            }
+
             forceJumpOnSubmitRef.current = true;
             event.currentTarget.form?.requestSubmit();
             return;
@@ -3677,16 +3717,50 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
             event.stopPropagation();
             event.currentTarget.form?.requestSubmit();
         }
-    }, [placeholderMatch, placeholderSuggestions, autocompleteSuggestions, autocompleteIndex, handleReplyEscapeKeyDown, insertAutocompletedPlaceholder, insertAutocompletedEmoji, openPlaceholderAutocomplete, undoReplyEdit]);
+    }, [placeholderMatch, placeholderSuggestions, autocompleteSuggestions, autocompleteIndex, focusInteractionAction, handleReplyEscapeKeyDown, insertAutocompletedPlaceholder, insertAutocompletedEmoji, notice, openPlaceholderAutocomplete, replyContent, replyFiles, selectedSticker, undoReplyEdit]);
 
     const handleCardBlurCapture = useCallback((event: React.FocusEvent<HTMLDivElement>) => {
         const nextTarget = event.relatedTarget;
         if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return;
 
         setIsFocusedWithin(false);
+        setInteractionNavIndex(null);
     }, []);
 
     const handleCardKeyDownCapture = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+        if (interactionNavIndex !== null) {
+            const actions = getInteractionActions();
+            const focusedIndex = actions.indexOf(document.activeElement as HTMLButtonElement);
+            const currentIndex = focusedIndex < 0 ? interactionNavIndex : focusedIndex;
+
+            if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                event.nativeEvent.stopImmediatePropagation?.();
+                setInteractionNavIndex(null);
+                replyInputRef.current?.focus({ preventScroll: true });
+                return;
+            }
+
+            if (event.key === "Tab" || ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+                event.preventDefault();
+                event.stopPropagation();
+                event.nativeEvent.stopImmediatePropagation?.();
+                const moveBack = event.key === "ArrowLeft" || event.key === "ArrowUp" || (event.key === "Tab" && event.shiftKey);
+                focusInteractionAction(currentIndex + (moveBack ? -1 : 1));
+                return;
+            }
+
+            if (event.key === "Enter") {
+                event.preventDefault();
+                event.stopPropagation();
+                event.nativeEvent.stopImmediatePropagation?.();
+                actions[currentIndex]?.click();
+                return;
+            }
+        }
+
+        if (event.target === replyInputRef.current && (event.ctrlKey || event.metaKey) && event.key === "Tab") return;
         if (!hasReplyPreview) return;
         if (!shouldHandleGlobalKeybind(event.nativeEvent, settings.store.replyChainToggleKeybind)) return;
 
@@ -3694,14 +3768,15 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         event.stopPropagation();
         event.nativeEvent.stopImmediatePropagation?.();
         setIsReplyExpanded(prev => !prev);
-    }, [hasReplyPreview]);
+    }, [focusInteractionAction, getInteractionActions, hasReplyPreview, interactionNavIndex]);
 
     const replyDisabled = !replyContent.trim() && !selectedSticker && replyFiles.length === 0;
     const noticeKindClass = notice.kind ? ` vc-mentions-box-card-${notice.kind}` : "";
 
     return (
         <div
-            className={`vc-mentions-box-card${noticeKindClass}${notice.deleted ? " vc-mentions-box-card-deleted" : ""}`}
+            ref={cardRef}
+            className={`vc-mentions-box-card${noticeKindClass}${notice.deleted ? " vc-mentions-box-card-deleted" : ""}${interactionNavIndex === null ? "" : " vc-mentions-box-card--interaction-nav"}`}
             data-mention-id={notice.id}
             tabIndex={-1}
             onMouseEnter={() => setIsHovered(true)}
@@ -3750,8 +3825,16 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
                                 {formatSentTime(notice.timestamp)}
                             </span>
                         </div>
+                        {notice.originalContent !== undefined && (
+                            <div className={`vc-mentions-box-content vc-mentions-box-original-content${isExpanded ? " vc-mentions-box-content--expanded" : ""}`}>
+                                {renderMessageContent(notice.originalContent, notice.channelId, notice.id)}
+                            </div>
+                        )}
                         <div ref={contentRef} className={`vc-mentions-box-content${isExpanded ? " vc-mentions-box-content--expanded" : ""}`}>
                             {renderMessageContent(displayContent, notice.channelId, notice.id)}
+                            {notice.originalContent !== undefined && (
+                                <span className={MessageClasses.edited}> (edited)</span>
+                            )}
                         </div>
                         {notice.deleted && (
                             <div className="vc-mentions-box-deleted-badge">
@@ -4073,7 +4156,10 @@ Right-click to delete this response`}
                             onChange={handleReplyChange}
                             onPaste={handleReplyPaste}
                             onSelect={handleReplySelect}
-                            onFocus={() => setReplyInputFocused(true)}
+                            onFocus={() => {
+                                setReplyInputFocused(true);
+                                setInteractionNavIndex(null);
+                            }}
                             onBlur={() => setReplyInputFocused(false)}
                             onKeyDownCapture={handleReplyEscapeKeyDown}
                             onKeyDown={handleReplyKeyDown}
@@ -4682,7 +4768,7 @@ export default definePlugin({
         },
 
         MESSAGE_UPDATE(payload: any) {
-            updateNoticeMedia(payload?.message ?? payload, payload?.channelId ?? payload?.channel_id);
+            updateNoticeMessage(payload?.message ?? payload, payload?.channelId ?? payload?.channel_id);
         },
 
         MESSAGE_DELETE(payload: any) {
