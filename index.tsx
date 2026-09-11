@@ -10,9 +10,10 @@ import { DataStore } from "@api/index";
 import { addServerListElement, removeServerListElement, ServerListRenderPosition } from "@api/ServerList";
 import { definePluginSettings } from "@api/Settings";
 import ErrorBoundary from "@components/ErrorBoundary";
+import { VoiceMessage } from "@plugins/voiceMessages";
 import definePlugin, { OptionType, type PluginAuthor } from "@utils/types";
 import type { CloudUpload as TCloudUpload, Emoji, MessageJSON, RenderModalProps, Sticker } from "@vencord/discord-types";
-import { ChannelType, CloudUploadPlatform, MessageType, StickerFormatType } from "@vencord/discord-types/enums";
+import { ChannelType, CloudUploadPlatform, MessageFlags, MessageType, StickerFormatType } from "@vencord/discord-types/enums";
 import { findByPropsLazy, findCssClassesLazy, findLazy } from "@webpack";
 import {
     ChannelStore,
@@ -92,7 +93,7 @@ interface ReplyPreview {
 
 interface MessageMediaPreview {
     id: string;
-    kind: "image" | "video" | "gif" | "sticker";
+    kind: "image" | "video" | "gif" | "sticker" | "audio";
     url: string;
     originalUrl?: string;
     filename?: string;
@@ -100,7 +101,14 @@ interface MessageMediaPreview {
     width?: number;
     height?: number;
     animated?: boolean;
+    waveform?: string;
+    durationSecs?: number;
 }
+
+type ReplyFile = File & {
+    waveform?: string;
+    durationSecs?: number;
+};
 
 interface StoredReaction {
     count: number;
@@ -166,6 +174,13 @@ interface PreselectedDialogue {
     content: string;
 }
 
+interface MessageCopyingRule {
+    id: string;
+    pattern: string;
+    flags: string;
+    replacement: string;
+}
+
 interface ReplyMessageReference {
     channel_id: string;
     message_id: string;
@@ -215,6 +230,7 @@ const DEFAULT_PRESELECTED_DIALOGUES: PreselectedDialogue[] = [
     { id: "looking", label: "Looking now", content: "I'm looking now." },
     { id: "got-it", label: "Got it", content: "Got it — thanks." }
 ];
+const DEFAULT_MESSAGE_COPYING_RULES: MessageCopyingRule[] = [];
 
 const EmojiUtils = findByPropsLazy("getURL", "getEmojiColors");
 const CloudUpload: typeof TCloudUpload = findLazy(module => module.prototype?.trackUploadFinished);
@@ -423,6 +439,14 @@ const settings = definePluginSettings({
     preselectedDialogues: {
         type: OptionType.CUSTOM,
         default: DEFAULT_PRESELECTED_DIALOGUES
+    },
+    messageCopyingSettings: {
+        type: OptionType.COMPONENT,
+        component: MessageCopyingSettings
+    },
+    messageCopyingRules: {
+        type: OptionType.CUSTOM,
+        default: DEFAULT_MESSAGE_COPYING_RULES
     },
     placeholderOrderSettings: {
         type: OptionType.COMPONENT,
@@ -1238,37 +1262,53 @@ function collectMessageMedia(...messages: any[]): MessageMediaPreview[] {
         media.push(item);
     }
 
-    for (const attachment of messages.flatMap(message => message?.attachments ?? [])) {
-        const url = getAttachmentUrl(attachment);
-        const originalUrl = getAttachmentOriginalUrl(attachment);
-        const contentType = getAttachmentContentType(attachment);
-        const filename = attachment.filename ?? attachment.name ?? "Attachment";
-        const { width } = attachment;
-        const { height } = attachment;
+    for (const message of messages) {
+        const isVoiceMessage = message?.hasFlag?.(MessageFlags.IS_VOICE_MESSAGE)
+            ?? Boolean(Number(message?.flags ?? 0) & MessageFlags.IS_VOICE_MESSAGE);
 
-        if (contentType.startsWith("image/") || IMAGE_EXTENSIONS.test(filename) || IMAGE_EXTENSIONS.test(url ?? "")) {
-            addMedia({
-                id: attachment.id ?? url,
-                kind: contentType.includes("gif") || /\.gif(?:[?#].*)?$/i.test(filename) ? "gif" : "image",
-                url,
-                originalUrl,
-                filename,
-                label: contentType.includes("gif") || /\.gif(?:[?#].*)?$/i.test(filename) ? "GIF" : "Image",
-                width,
-                height,
-                animated: contentType.includes("gif") || /\.gif(?:[?#].*)?$/i.test(filename)
-            });
-        } else if (contentType.startsWith("video/") || VIDEO_EXTENSIONS.test(filename) || VIDEO_EXTENSIONS.test(url ?? "")) {
-            addMedia({
-                id: attachment.id ?? url,
-                kind: "video",
-                url,
-                originalUrl,
-                filename,
-                label: "Video",
-                width,
-                height
-            });
+        for (const attachment of message?.attachments ?? []) {
+            const url = getAttachmentUrl(attachment);
+            const originalUrl = getAttachmentOriginalUrl(attachment);
+            const contentType = getAttachmentContentType(attachment);
+            const filename = attachment.filename ?? attachment.name ?? "Attachment";
+            const { width } = attachment;
+            const { height } = attachment;
+
+            if (isVoiceMessage) {
+                addMedia({
+                    id: attachment.id ?? url,
+                    kind: "audio",
+                    url,
+                    originalUrl,
+                    filename,
+                    label: "Voice note",
+                    waveform: attachment.waveform,
+                    durationSecs: attachment.duration_secs ?? attachment.durationSecs
+                });
+            } else if (contentType.startsWith("image/") || IMAGE_EXTENSIONS.test(filename) || IMAGE_EXTENSIONS.test(url ?? "")) {
+                addMedia({
+                    id: attachment.id ?? url,
+                    kind: contentType.includes("gif") || /\.gif(?:[?#].*)?$/i.test(filename) ? "gif" : "image",
+                    url,
+                    originalUrl,
+                    filename,
+                    label: contentType.includes("gif") || /\.gif(?:[?#].*)?$/i.test(filename) ? "GIF" : "Image",
+                    width,
+                    height,
+                    animated: contentType.includes("gif") || /\.gif(?:[?#].*)?$/i.test(filename)
+                });
+            } else if (contentType.startsWith("video/") || VIDEO_EXTENSIONS.test(filename) || VIDEO_EXTENSIONS.test(url ?? "")) {
+                addMedia({
+                    id: attachment.id ?? url,
+                    kind: "video",
+                    url,
+                    originalUrl,
+                    filename,
+                    label: "Video",
+                    width,
+                    height
+                });
+            }
         }
     }
 
@@ -1385,6 +1425,8 @@ function renderMessageContent(content: string, channelId?: string, messageId?: s
 }
 
 function openMentionMedia(media: MessageMediaPreview) {
+    if (media.kind === "audio") return;
+
     openMediaModal({
         location: "MentionsBox",
         items: [{
@@ -1405,7 +1447,15 @@ function MessageMedia({ media, compact = false }: { media: MessageMediaPreview[]
 
     return (
         <div className={`vc-mentions-box-media${compact ? " vc-mentions-box-media-compact" : ""}`}>
-            {media.map(item => (
+            {media.map(item => item.kind === "audio" ? (
+                <div
+                    className="vc-mentions-box-media-audio"
+                    key={`${item.kind}-${item.id}`}
+                    onClick={event => event.stopPropagation()}
+                >
+                    <VoiceMessage src={item.url} waveform={item.waveform ?? "AAAAAAAAAAAA"} />
+                </div>
+            ) : (
                 <button
                     className={`vc-mentions-box-media-item${item.kind === "sticker" ? " vc-mentions-box-media-sticker" : ""}`}
                     key={`${item.kind}-${item.id}`}
@@ -2070,12 +2120,38 @@ async function setReactionOnNotice(notice: MentionNotice, emoji: Emoji, isReacte
     }
 }
 
-async function uploadReplyAttachment(file: File, channelId: string) {
+function isVoiceReplyFile(file: ReplyFile) {
+    return Boolean(file.waveform) && typeof file.durationSecs === "number";
+}
+
+async function copyVoiceMessageFile(media: MessageMediaPreview): Promise<ReplyFile> {
+    if (media.kind !== "audio" || !media.waveform || typeof media.durationSecs !== "number") {
+        throw new Error("Voice note metadata is unavailable");
+    }
+
+    const response = await fetch(media.originalUrl ?? media.url);
+    if (!response.ok) throw new Error(`Failed to download voice note (${response.status})`);
+
+    const blob = await response.blob();
+    return Object.assign(
+        new File([blob], media.filename ?? "voice-message.ogg", {
+            type: blob.type || "audio/ogg; codecs=opus"
+        }),
+        {
+            waveform: media.waveform,
+            durationSecs: media.durationSecs
+        }
+    );
+}
+
+async function uploadReplyAttachment(file: ReplyFile, channelId: string) {
     const upload = new CloudUpload({
         file,
         isThumbnail: false,
         platform: CloudUploadPlatform.WEB
     }, channelId);
+    upload.waveform = file.waveform;
+    upload.durationSecs = file.durationSecs;
 
     return new Promise<TCloudUpload>((resolve, reject) => {
         upload.on("complete", () => resolve(upload));
@@ -2086,6 +2162,9 @@ async function uploadReplyAttachment(file: File, channelId: string) {
 
 async function sendReplyToNotice(notice: MentionNotice, content: string, stickerIds: string[] = [], uploads: TCloudUpload[] = []) {
     const isTypingNotice = notice.kind === "typing";
+    const isVoiceMessage = uploads.length === 1
+        && Boolean(uploads[0].waveform)
+        && typeof uploads[0].durationSecs === "number";
     const messageReference: ReplyMessageReference | null = isTypingNotice ? null : {
             channel_id: notice.channelId,
             message_id: notice.id
@@ -2102,14 +2181,18 @@ async function sendReplyToNotice(notice: MentionNotice, content: string, sticker
             attachments: uploads.map((upload, index) => ({
                 id: String(index),
                 filename: upload.filename,
-                uploaded_filename: upload.uploadedFilename
+                uploaded_filename: upload.uploadedFilename,
+                ...(isVoiceMessage ? {
+                    waveform: upload.waveform,
+                    duration_secs: upload.durationSecs
+                } : {})
             })),
             channel_id: notice.channelId,
-            content,
-            flags: 0,
+            content: isVoiceMessage ? "" : content,
+            flags: isVoiceMessage ? MessageFlags.IS_VOICE_MESSAGE : 0,
             ...(messageReference ? { message_reference: messageReference } : {}),
             nonce: `${Date.now()}`,
-            ...(stickerIds.length > 0 ? { sticker_ids: stickerIds } : {}),
+            ...(isVoiceMessage ? { sticker_ids: [] } : stickerIds.length > 0 ? { sticker_ids: stickerIds } : {}),
             tts: false,
             type: 0
         }
@@ -2139,7 +2222,7 @@ function isSendCooldownError(error: any) {
         || message.includes("rate limited");
 }
 
-async function sendReplyToNoticeWithCooldownRetry(notice: MentionNotice, content: string, stickerIds: string[] = [], files: File[] = []) {
+async function sendReplyToNoticeWithCooldownRetry(notice: MentionNotice, content: string, stickerIds: string[] = [], files: ReplyFile[] = []) {
     const uploads = await Promise.all(files.map(file => uploadReplyAttachment(file, notice.channelId)));
 
     for (;;) {
@@ -2507,6 +2590,35 @@ function dedupeEmojis(emojis: Emoji[]) {
     });
 }
 
+function normalizeMessageCopyingRule(rule: Partial<MessageCopyingRule>, index: number): MessageCopyingRule {
+    return {
+        id: rule.id || crypto.randomUUID?.() || `message-copying-rule-${index}`,
+        pattern: typeof rule.pattern === "string" ? rule.pattern : "",
+        flags: typeof rule.flags === "string" ? rule.flags : "gi",
+        replacement: typeof rule.replacement === "string" ? rule.replacement : ""
+    };
+}
+
+function getMessageCopyingRules(): MessageCopyingRule[] {
+    const saved = settings.store.messageCopyingRules;
+    if (!Array.isArray(saved)) return DEFAULT_MESSAGE_COPYING_RULES;
+
+    return saved.map(normalizeMessageCopyingRule);
+}
+
+function applyMessageCopyingRules(content: string, replacements: Record<string, string>) {
+    return getMessageCopyingRules().reduce((result, rule) => {
+        if (!rule.pattern) return result;
+
+        try {
+            const replacement = resolveReplyPlaceholders(rule.replacement, replacements);
+            return result.replace(new RegExp(rule.pattern, rule.flags), () => replacement);
+        } catch {
+            return result;
+        }
+    }, content);
+}
+
 function getReplyPlaceholderReplacements(notice: MentionNotice): Record<string, string> {
     const me = UserStore.getCurrentUser();
     const meNickname = me?.id ? RelationshipStore.getNickname(me.id) : null;
@@ -2516,7 +2628,7 @@ function getReplyPlaceholderReplacements(notice: MentionNotice): Record<string, 
     const meName = meNickname ?? meDisplayName;
     const messageLink = `https://discord.com/channels/${notice.guildId ?? "@me"}/${notice.channelId}/${notice.id}`;
 
-    return {
+    const replacements: Record<string, string> = {
         "server.name": notice.guildName ?? "Direct Messages",
         "channel.name": notice.channelName,
         "channel.id": notice.channelId,
@@ -2547,6 +2659,9 @@ function getReplyPlaceholderReplacements(notice: MentionNotice): Record<string, 
         "me.display-name": meName,
         "me.id": me?.id ?? ""
     };
+
+    replacements["message.content"] = applyMessageCopyingRules(replacements["message.content"], replacements);
+    return replacements;
 }
 
 function resolveInteractionReply(content: string, notice: MentionNotice) {
@@ -2574,6 +2689,15 @@ function getPreselectedDialogues(): PreselectedDialogue[] {
     if (!Array.isArray(saved)) return DEFAULT_PRESELECTED_DIALOGUES;
 
     return saved.map(normalizeDialogue);
+}
+
+function makeEmptyMessageCopyingRule(): MessageCopyingRule {
+    return {
+        id: crypto.randomUUID(),
+        pattern: "",
+        flags: "gi",
+        replacement: ""
+    };
 }
 
 type KeybindSetting = "hideToggleKeybind" | "dialogueModeToggleKeybind" | "jumpOnReplyToggleKeybind" | "sourceFilterToggleKeybind" | "replyChainToggleKeybind";
@@ -2904,6 +3028,408 @@ function PreselectedDialogueSettings() {
         </div>
     );
 }
+
+const MESSAGE_COPYING_PREVIEW_REPLACEMENTS: Record<string, string> = {
+    ...Object.fromEntries(REPLY_PLACEHOLDERS.map(placeholder => [placeholder.key, placeholder.label])),
+    "author.display-name": "Author display name",
+    "me.display-name": "Your display name",
+    "replied-user.name": "Author name",
+    "replied-user.nickname": "Author nickname",
+    "replied-user.servernickname": "Server nickname",
+    "replied-user.username": "Author username",
+    "replied-user.displayname": "Author display name",
+    "replied-user.display-name": "Author display name",
+    "replied-user.id": "Author ID"
+};
+const MESSAGE_COPYING_PLACEHOLDER_KEYS = new Set(Object.keys(MESSAGE_COPYING_PREVIEW_REPLACEMENTS));
+
+function MessageCopyingSettings() {
+    const [, forceUpdate] = useState(0);
+    const [selectedId, setSelectedId] = useState<string | null>(null);
+    const [testMessage, setTestMessage] = useState("how are you dean?");
+    const rules = getMessageCopyingRules();
+    const selectedIndex = Math.max(0, rules.findIndex(rule => rule.id === selectedId));
+    const selectedRule = rules[selectedIndex];
+    const replacementPlaceholders = selectedRule
+        ? Array.from(selectedRule.replacement.matchAll(/\{([^}]+)\}/g), match => ({ key: match[1], token: match[0] }))
+        : [];
+    const resolvedPreviewReplacement = selectedRule
+        ? resolveReplyPlaceholders(selectedRule.replacement, MESSAGE_COPYING_PREVIEW_REPLACEMENTS)
+        : "";
+    let previewAfter = testMessage;
+    let previewMatches: RegExpMatchArray[] = [];
+    let previewError = "";
+
+    if (selectedRule?.pattern) {
+        try {
+            const regex = new RegExp(selectedRule.pattern, selectedRule.flags);
+            previewAfter = testMessage.replace(regex, () => resolvedPreviewReplacement);
+            if (regex.global) {
+                previewMatches = Array.from(testMessage.matchAll(regex)) as RegExpMatchArray[];
+                previewMatches = previewMatches.filter(match => match[0]);
+            } else {
+                const match = regex.exec(testMessage);
+                previewMatches = match?.[0] ? [match] : [];
+            }
+        } catch (error) {
+            previewError = error instanceof Error ? error.message : "Invalid regular expression";
+        }
+    }
+
+    function setRules(next: MessageCopyingRule[]) {
+        settings.store.messageCopyingRules = next;
+        if (next.length && (!selectedId || !next.some(rule => rule.id === selectedId))) {
+            setSelectedId(next[Math.min(selectedIndex, next.length - 1)].id);
+        }
+        forceUpdate(version => version + 1);
+    }
+
+    function updateRule(index: number, patch: Partial<MessageCopyingRule>) {
+        setRules(rules.map((rule, idx) => idx === index ? { ...rule, ...patch } : rule));
+    }
+
+    function moveRule(index: number, direction: -1 | 1) {
+        const target = index + direction;
+        if (target < 0 || target >= rules.length) return;
+
+        const next = [...rules];
+        [next[index], next[target]] = [next[target], next[index]];
+        setRules(next);
+    }
+
+    function addRule() {
+        const rule = makeEmptyMessageCopyingRule();
+        setRules([...rules, rule]);
+        setSelectedId(rule.id);
+    }
+
+    function removeSelectedRule() {
+        if (!selectedRule) return;
+
+        const next = rules.filter(rule => rule.id !== selectedRule.id);
+        setRules(next);
+        setSelectedId(next[Math.min(selectedIndex, next.length - 1)]?.id ?? null);
+    }
+
+    function renderHighlightedPreview() {
+        if (!previewMatches.length) return testMessage;
+
+        const parts: React.ReactNode[] = [];
+        let cursor = 0;
+        for (const match of previewMatches) {
+            const start = match.index ?? 0;
+            parts.push(testMessage.slice(cursor, start));
+            parts.push(<span className="vc-mentions-box-settings-copy-highlight" key={`${start}-${match[0]}`}>{match[0]}</span>);
+            cursor = start + match[0].length;
+        }
+        parts.push(testMessage.slice(cursor));
+        return parts;
+    }
+
+    function renderHighlightedAfterPreview() {
+        if (!previewMatches.length || !resolvedPreviewReplacement) return previewAfter;
+
+        const start = previewAfter.indexOf(resolvedPreviewReplacement, previewMatches[0].index ?? 0);
+        if (start === -1) return previewAfter;
+
+        return (
+            <>
+                {previewAfter.slice(0, start)}
+                <span className="vc-mentions-box-settings-copy-inserted">{resolvedPreviewReplacement}</span>
+                {previewAfter.slice(start + resolvedPreviewReplacement.length)}
+            </>
+        );
+    }
+
+    return (
+        <div className="vc-mentions-box-settings">
+            <div>
+                <div className="vc-mentions-box-settings-heading">Message Copying - Replace Custom Words</div>
+                <div className="vc-mentions-box-settings-description">
+                    Replace words in the original message when using the message.content placeholder.
+                </div>
+            </div>
+            <div className="vc-mentions-box-settings-subheading">Rules and order</div>
+            <div className="vc-mentions-box-settings-preview" aria-label="Message copying rules">
+                {rules.length ? rules.map((rule, index) => (
+                    <button
+                        className={`vc-mentions-box-settings-preview-button${rule.id === selectedRule?.id ? " vc-mentions-box-settings-preview-button-selected" : ""}`}
+                        key={rule.id}
+                        type="button"
+                        onClick={() => setSelectedId(rule.id)}
+                    >
+                        {rule.pattern || `Rule ${index + 1}`}
+                    </button>
+                )) : (
+                    <div className="vc-mentions-box-settings-empty">No replacement rules yet.</div>
+                )}
+            </div>
+            <button
+                className="vc-mentions-box-settings-add"
+                type="button"
+                onClick={addRule}
+            >
+                Add rule
+            </button>
+            {selectedRule && (
+                <div className="vc-mentions-box-settings-editor">
+                    <div className="vc-mentions-box-settings-rule">
+                        <input
+                            className="vc-mentions-box-settings-input"
+                            value={selectedRule.pattern}
+                            onChange={event => updateRule(selectedIndex, { pattern: event.currentTarget.value })}
+                            placeholder="Regex pattern"
+                            aria-label="Regex pattern"
+                        />
+                        <input
+                            className="vc-mentions-box-settings-input"
+                            value={selectedRule.flags}
+                            onChange={event => updateRule(selectedIndex, { flags: event.currentTarget.value })}
+                            placeholder="Flags"
+                            aria-label="Regex flags"
+                        />
+                        <div className="vc-mentions-box-settings-replacement">
+                            <input
+                                className="vc-mentions-box-settings-input"
+                                value={selectedRule.replacement}
+                                onChange={event => updateRule(selectedIndex, { replacement: event.currentTarget.value })}
+                                placeholder="Replacement or {author.nickname}"
+                                aria-label="Replacement"
+                            />
+                            {replacementPlaceholders.length > 0 && (
+                                <div className="vc-mentions-box-settings-placeholder-badges">
+                                    {replacementPlaceholders.map((placeholder, index) => (
+                                        <span
+                                            className={`vc-mentions-box-settings-placeholder-pill ${MESSAGE_COPYING_PLACEHOLDER_KEYS.has(placeholder.key)
+                                                ? "vc-mentions-box-settings-placeholder-valid"
+                                                : "vc-mentions-box-settings-error"}`}
+                                            key={`${placeholder.token}-${index}`}
+                                        >
+                                            {placeholder.token}
+                                        </span>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                    {previewError && <div className="vc-mentions-box-settings-error">{previewError}</div>}
+                    <div className="vc-mentions-box-settings-editor-actions">
+                        <button
+                            className="vc-mentions-box-settings-move"
+                            type="button"
+                            disabled={selectedIndex === 0}
+                            onClick={() => moveRule(selectedIndex, -1)}
+                        >
+                            Move left
+                        </button>
+                        <button
+                            className="vc-mentions-box-settings-move"
+                            type="button"
+                            disabled={selectedIndex === rules.length - 1}
+                            onClick={() => moveRule(selectedIndex, 1)}
+                        >
+                            Move right
+                        </button>
+                        <button
+                            className="vc-mentions-box-settings-remove"
+                            type="button"
+                            onClick={removeSelectedRule}
+                        >
+                            Remove selected
+                        </button>
+                    </div>
+                </div>
+            )}
+            <div className="vc-mentions-box-settings-subheading">Preview</div>
+            <input
+                className="vc-mentions-box-settings-input"
+                value={testMessage}
+                onChange={event => setTestMessage(event.currentTarget.value)}
+                placeholder="Test message"
+                aria-label="Test message"
+            />
+            <div className="vc-mentions-box-settings-copy-preview">
+                <div>
+                    <div className="vc-mentions-box-settings-subheading">Before</div>
+                    <div className="vc-mentions-box-settings-copy-output">{renderHighlightedPreview()}</div>
+                </div>
+                <div>
+                    <div className="vc-mentions-box-settings-subheading">After</div>
+                    <div className="vc-mentions-box-settings-copy-output">{renderHighlightedAfterPreview()}</div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+const MENTION_OR_EMOJI_TOKEN_REGEX = /<@!?\d+>|<a?:\w+:\d+>/g;
+
+function getReplyNodeRawText(node: ChildNode) {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+    if (!(node instanceof HTMLElement)) return node.textContent ?? "";
+
+    const raw = node.getAttribute("data-raw");
+    if (raw !== null) return raw;
+    if (node.tagName === "BR") return "\n";
+    return node.textContent ?? "";
+}
+
+function serializeReplyContent(container: HTMLElement) {
+    if (container.childNodes.length === 1 && (container.firstChild as HTMLElement)?.tagName === "BR") return "";
+    return Array.from(container.childNodes, getReplyNodeRawText).join("");
+}
+
+function buildReplyEditorDom(raw: string, container: HTMLElement) {
+    container.replaceChildren();
+
+    const appendText = (text: string) => {
+        const lines = text.split("\n");
+        lines.forEach((line, index) => {
+            if (line) container.appendChild(document.createTextNode(line));
+            if (index < lines.length - 1) container.appendChild(document.createElement("br"));
+        });
+    };
+
+    let lastIndex = 0;
+    for (const match of raw.matchAll(MENTION_OR_EMOJI_TOKEN_REGEX)) {
+        const token = match[0];
+        const index = match.index ?? 0;
+        appendText(raw.slice(lastIndex, index));
+
+        if (token.startsWith("<@")) {
+            const id = token.match(/\d+/)?.[0] ?? "";
+            const user = UserStore.getUser(id);
+            const displayName = (container.dataset.guildId ? GuildMemberStore.getMember(container.dataset.guildId, id)?.nick : null)
+                ?? RelationshipStore.getNickname(id)
+                ?? user?.globalName
+                ?? user?.username
+                ?? id;
+            const mention = document.createElement("span");
+            mention.contentEditable = "false";
+            mention.dataset.raw = token;
+            mention.className = "vc-mentions-box-reply-token vc-mentions-box-reply-token-mention";
+            mention.textContent = `@${displayName}`;
+            mention.style.cursor = "pointer";
+            mention.addEventListener("click", event => {
+                event.preventDefault();
+                event.stopPropagation();
+                UserProfileActions.openUserProfileModal({
+                    userId: id,
+                    guildId: container.dataset.guildId || undefined,
+                    channelId: container.dataset.channelId || undefined,
+                    analyticsLocation: {
+                        page: container.dataset.guildId ? "Guild Channel" : "DM Channel",
+                        section: "MentionsBox"
+                    }
+                });
+            });
+            container.appendChild(mention);
+        } else {
+            const [, animated, name, id] = token.match(/^<(a?):(\w+):(\d+)>$/) ?? [];
+            const emoji = document.createElement("span");
+            const image = document.createElement("img");
+            emoji.contentEditable = "false";
+            emoji.dataset.raw = token;
+            emoji.className = "vc-mentions-box-reply-token";
+            image.className = "vc-mentions-box-reply-token-emoji";
+            image.src = getEmojiImageUrl({ id, name, animated: Boolean(animated) } as Emoji);
+            image.alt = `:${name}:`;
+            image.draggable = false;
+            emoji.appendChild(image);
+            container.appendChild(emoji);
+        }
+
+        lastIndex = index + token.length;
+    }
+
+    appendText(raw.slice(lastIndex));
+}
+
+function getReplyCursorOffset(container: HTMLElement) {
+    const selection = document.getSelection();
+    const anchorNode = selection?.anchorNode;
+    const anchorOffset = selection?.anchorOffset ?? 0;
+    if (!selection?.rangeCount || !anchorNode || (anchorNode !== container && !container.contains(anchorNode))) {
+        return serializeReplyContent(container).length;
+    }
+
+    const children = Array.from(container.childNodes);
+    if (anchorNode === container) {
+        return children.slice(0, anchorOffset).reduce((length, child) => length + getReplyNodeRawText(child).length, 0);
+    }
+
+    let directChild = anchorNode;
+    while (directChild.parentNode && directChild.parentNode !== container) directChild = directChild.parentNode;
+
+    let offset = 0;
+    for (const child of children) {
+        if (child !== directChild) {
+            offset += getReplyNodeRawText(child).length;
+            continue;
+        }
+
+        if (child.nodeType === Node.TEXT_NODE && anchorNode === child) {
+            return offset + Math.min(anchorOffset, child.textContent?.length ?? 0);
+        }
+
+        const caretRange = selection.getRangeAt(0).cloneRange();
+        const childRange = document.createRange();
+        caretRange.collapse(true);
+        childRange.selectNode(child);
+        return offset + (caretRange.compareBoundaryPoints(Range.START_TO_START, childRange) > 0
+            ? getReplyNodeRawText(child).length
+            : 0);
+    }
+
+    return offset;
+}
+
+function setReplyCaretOffset(container: HTMLElement, rawOffset: number) {
+    const children = Array.from(container.childNodes);
+    const target = Math.max(0, Math.min(rawOffset, serializeReplyContent(container).length));
+    const range = document.createRange();
+    let consumed = 0;
+    let positioned = false;
+
+    for (const [index, child] of children.entries()) {
+        const { length } = getReplyNodeRawText(child);
+
+        if (target === consumed) {
+            range.setStart(container, index);
+            positioned = true;
+            break;
+        }
+
+        if (target < consumed + length) {
+            if (child.nodeType === Node.TEXT_NODE) {
+                range.setStart(child, target - consumed);
+            } else {
+                range.setStart(container, index + (target - consumed >= length / 2 ? 1 : 0));
+            }
+            positioned = true;
+            break;
+        }
+
+        consumed += length;
+    }
+
+    if (!positioned) range.setStart(container, children.length);
+    range.collapse(true);
+
+    const selection = document.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+}
+
+function findReplyTokenAtCursor(content: string, cursorPos: number, key: "Backspace" | "Delete") {
+    return Array.from(content.matchAll(MENTION_OR_EMOJI_TOKEN_REGEX)).find(match => {
+        const start = match.index ?? 0;
+        return key === "Backspace"
+            ? start + match[0].length === cursorPos
+            : start === cursorPos;
+    });
+}
+
 function emojiToInsertText(emoji: Emoji) {
     if (emoji.id) {
         return emoji.animated
@@ -2964,10 +3490,11 @@ function getClipboardFiles(data: DataTransfer) {
     return [...new Map(files.map(file => [`${file.name}:${file.type}:${file.size}`, file])).values()];
 }
 
-function ReplyMediaPreview({ file, onRemove }: { file: File; onRemove(): void; }) {
+function ReplyMediaPreview({ file, onRemove }: { file: ReplyFile; onRemove(): void; }) {
     const [previewUrl, setPreviewUrl] = useState("");
     const isImage = file.type.startsWith("image/") || IMAGE_EXTENSIONS.test(file.name);
     const isVideo = file.type.startsWith("video/") || VIDEO_EXTENSIONS.test(file.name);
+    const isVoice = isVoiceReplyFile(file);
 
     useEffect(() => {
         const url = URL.createObjectURL(file);
@@ -2976,8 +3503,12 @@ function ReplyMediaPreview({ file, onRemove }: { file: File; onRemove(): void; }
     }, [file]);
 
     return (
-        <div className="vc-mentions-box-reply-media">
-            {isImage && previewUrl
+        <div className={`vc-mentions-box-reply-media${isVoice ? " vc-mentions-box-reply-media-voice" : ""}`}>
+            {isVoice && previewUrl
+                ? <div className="vc-mentions-box-reply-media-voice-player">
+                    <VoiceMessage src={previewUrl} waveform={file.waveform!} />
+                </div>
+                : isImage && previewUrl
                 ? <img src={previewUrl} alt="" />
                 : isVideo && previewUrl
                     ? <video src={previewUrl} aria-hidden />
@@ -2991,7 +3522,7 @@ function ReplyMediaPreview({ file, onRemove }: { file: File; onRemove(): void; }
 const EMOJI_AUTOCOMPLETE_ID = "vc-mentions-box-emoji-autocomplete";
 
 interface ReplyAutocompleteLayerProps {
-    inputRef: React.RefObject<HTMLTextAreaElement | null>;
+    inputRef: React.RefObject<HTMLDivElement | null>;
     replyContent: string;
     placeholderMatch: ReplyPlaceholderMatch | null;
     placeholderSuggestions: ReplyPlaceholderSuggestion[];
@@ -3148,7 +3679,6 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     const [isInteractionExpanded, setIsInteractionExpanded] = useState(false);
     const [isHovered, setIsHovered] = useState(false);
     const [isFocusedWithin, setIsFocusedWithin] = useState(false);
-    const [replyInputFocused, setReplyInputFocused] = useState(false);
     const [interactionSearch, setInteractionSearchRaw] = useState(
         () => settings.store.persistInteractionSearch ? sharedInteractionSearch : ""
     );
@@ -3159,26 +3689,34 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     const [emojiSearch, setEmojiSearch] = useState("");
     const [hoveredEmoji, setHoveredEmoji] = useState<Emoji | null>(null);
     const [selectedSticker, setSelectedSticker] = useState<SelectedReplySticker>(null);
-    const [replyFiles, setReplyFiles] = useState<File[]>([]);
+    const [replyFiles, setReplyFiles] = useState<ReplyFile[]>([]);
+    const [isCopyingVoice, setIsCopyingVoice] = useState(false);
     const [contentOverflows, setContentOverflows] = useState(false);
     const [interactionNavIndex, setInteractionNavIndex] = useState<number | null>(null);
     const [pickerPos, setPickerPos] = useState<{ bottom: number; right: number; } | null>(null);
     const [stickerPickerPos, setStickerPickerPos] = useState<{ bottom: number; right: number; } | null>(null);
     const cardRef = useRef<HTMLDivElement>(null);
-    const replyInputRef = useRef<HTMLTextAreaElement>(null);
+    const replyInputRef = useRef<HTMLDivElement>(null);
     const emojiPickerRef = useRef<HTMLDivElement>(null);
     const pickerTriggerRef = useRef<HTMLButtonElement>(null);
     const stickerPickerRef = useRef<HTMLDivElement>(null);
     const stickerPickerTriggerRef = useRef<HTMLButtonElement>(null);
     const contentRef = useRef<HTMLDivElement>(null);
     const replyHistoryRef = useRef<Array<{ content: string; cursorPos: number; }>>([]);
+    const isLocalEditRef = useRef(false);
+    const pendingCaretOffsetRef = useRef<number | null>(null);
     const forceJumpOnSubmitRef = useRef(false);
     const isLong = contentOverflows || isExpanded;
     const displayContent = notice.content;
     const isTypingNotice = notice.kind === "typing";
     const replyChain = notice.replyChain ?? [];
+    const voiceMessage = notice.media.find(media => media.kind === "audio");
+    const hasReplayableVoiceMessage = Boolean(
+        voiceMessage?.waveform
+        && typeof voiceMessage.durationSecs === "number"
+    );
     const hasReplyPreview = replyChain.length > 0 || Boolean(notice.referencedAuthorName);
-    const { autoExpandReadMore, dialogueButtonMode, jumpToMentionOnClick, placeholderOrder, preselectedDialogues, persistInteractionSearch, preloadMentionContext } = settings.use(["autoExpandReadMore", "dialogueButtonMode", "jumpToMentionOnClick", "placeholderOrder", "preselectedDialogues", "persistInteractionSearch", "preloadMentionContext"]);
+    const { autoExpandReadMore, dialogueButtonMode, jumpToMentionOnClick, messageCopyingRules, placeholderOrder, preselectedDialogues, persistInteractionSearch, preloadMentionContext } = settings.use(["autoExpandReadMore", "dialogueButtonMode", "jumpToMentionOnClick", "messageCopyingRules", "placeholderOrder", "preselectedDialogues", "persistInteractionSearch", "preloadMentionContext"]);
     const setInteractionSearch = useCallback((value: string) => {
         if (persistInteractionSearch) setSharedInteractionSearch(value);
         setInteractionSearchRaw(value);
@@ -3216,7 +3754,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     );
     const placeholderReplacements = useMemo(
         () => getReplyPlaceholderReplacements(notice),
-        [notice]
+        [messageCopyingRules, notice]
     );
 
     const autocompleteSuggestions = useMemo<Emoji[]>(
@@ -3252,6 +3790,22 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         if (persistInteractionSearch) return;
         if (!isInteractionExpanded && interactionSearch) setInteractionSearch("");
     }, [isInteractionExpanded, interactionSearch, persistInteractionSearch, setInteractionSearch]);
+    useLayoutEffect(() => {
+        const el = replyInputRef.current;
+        if (!el) return;
+
+        if (isLocalEditRef.current) {
+            isLocalEditRef.current = false;
+            return;
+        }
+
+        buildReplyEditorDom(replyContent, el);
+        const pendingCaretOffset = pendingCaretOffsetRef.current;
+        pendingCaretOffsetRef.current = null;
+        if (pendingCaretOffset !== null || document.activeElement === el) {
+            setReplyCaretOffset(el, pendingCaretOffset ?? replyContent.length);
+        }
+    }, [replyContent]);
     useEffect(() => {
         const el = replyInputRef.current;
         if (!el) return;
@@ -3353,7 +3907,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         markCurrentNoticeRead();
     }, [markCurrentNoticeRead]);
 
-    const sendReplyInBackground = useCallback((content: string, stickerIds: string[], failureMessage: string, delayMs: number, files: File[] = []) => {
+    const sendReplyInBackground = useCallback((content: string, stickerIds: string[], failureMessage: string, delayMs: number, files: ReplyFile[] = []) => {
         window.setTimeout(() => {
             void sendReplyToNoticeWithCooldownRetry(notice, content, stickerIds, files)
                 .catch(error => {
@@ -3368,6 +3922,33 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         }, delayMs);
     }, [notice]);
 
+    const loadVoiceReply = useCallback(async() => {
+        if (!voiceMessage || isCopyingVoice) return null;
+
+        setIsCopyingVoice(true);
+        try {
+            return await copyVoiceMessageFile(voiceMessage);
+        } catch (error) {
+            console.error("[MentionsBox] Failed to copy voice note", error);
+            showKeybindSettingToast("Failed to copy voice note.");
+            return null;
+        } finally {
+            setIsCopyingVoice(false);
+        }
+    }, [isCopyingVoice, voiceMessage]);
+
+    const copyVoiceToReply = useCallback(async() => {
+        const file = await loadVoiceReply();
+        if (!file) return;
+
+        pendingCaretOffsetRef.current = 0;
+        setReplyContent("");
+        setCursorPos(0);
+        setSelectedSticker(null);
+        setReplyFiles([file]);
+        requestAnimationFrame(() => replyInputRef.current?.focus());
+    }, [loadVoiceReply]);
+
     const pushReplyHistory = useCallback(() => {
         const history = replyHistoryRef.current;
         const last = history.at(-1);
@@ -3381,41 +3962,73 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         const previous = replyHistoryRef.current.pop();
         if (!previous) return false;
 
+        pendingCaretOffsetRef.current = previous.cursorPos;
         setReplyContent(previous.content);
         setCursorPos(previous.cursorPos);
-        requestAnimationFrame(() => {
-            replyInputRef.current?.focus();
-            replyInputRef.current?.setSelectionRange(previous.cursorPos, previous.cursorPos);
-        });
+        requestAnimationFrame(() => replyInputRef.current?.focus());
 
         return true;
     }, []);
 
-    const handleReplyChange = useCallback((event: React.ChangeEvent<HTMLTextAreaElement>) => {
-        const rawContent = event.currentTarget.value;
-        const rawCursorPos = event.currentTarget.selectionStart ?? rawContent.length;
+    const updateReplyFromEditor = useCallback((container: HTMLDivElement) => {
+        const rawContent = serializeReplyContent(container);
+        const rawCursorPos = getReplyCursorOffset(container);
         const translated = translateEmojiShortcodes(rawContent, notice.guildId, rawCursorPos);
+        const hasUnrenderedToken = Array.from(container.childNodes).some(node =>
+            node.nodeType === Node.TEXT_NODE && Boolean(node.textContent?.match(MENTION_OR_EMOJI_TOKEN_REGEX))
+        );
 
+        if (replyFiles.some(isVoiceReplyFile)) setReplyFiles([]);
+        pendingCaretOffsetRef.current = null;
+        if (translated.content === rawContent && !hasUnrenderedToken) {
+            isLocalEditRef.current = true;
+        } else {
+            pendingCaretOffsetRef.current = translated.cursorPos;
+        }
         setReplyContent(translated.content);
         setCursorPos(translated.cursorPos);
 
-        if (translated.content !== rawContent) {
-            requestAnimationFrame(() => {
-                replyInputRef.current?.setSelectionRange(translated.cursorPos, translated.cursorPos);
-            });
-        }
-    }, [notice.guildId]);
+        if (!rawContent && container.childNodes.length) container.replaceChildren();
+    }, [notice.guildId, replyFiles]);
 
-    const handleReplyPaste = useCallback((event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const handleReplyChange = useCallback((event: React.FormEvent<HTMLDivElement>) => {
+        updateReplyFromEditor(event.currentTarget);
+    }, [updateReplyFromEditor]);
+
+    const handleReplyPaste = useCallback((event: React.ClipboardEvent<HTMLDivElement>) => {
         const files = getClipboardFiles(event.clipboardData);
-        if (!files.length) return;
+        if (files.length) {
+            event.preventDefault();
+            setReplyFiles(current => {
+                const kept = current.some(isVoiceReplyFile) ? [] : current;
+                const existing = new Set(kept.map(file => `${file.name}:${file.type}:${file.size}`));
+                return [...kept, ...files.filter(file => !existing.has(`${file.name}:${file.type}:${file.size}`))];
+            });
+            return;
+        }
 
+        const text = event.clipboardData.getData("text/plain");
         event.preventDefault();
-        setReplyFiles(current => {
-            const existing = new Set(current.map(file => `${file.name}:${file.type}:${file.size}`));
-            return [...current, ...files.filter(file => !existing.has(`${file.name}:${file.type}:${file.size}`))];
-        });
-    }, []);
+        if (!text) return;
+
+        pushReplyHistory();
+        const selection = document.getSelection();
+        const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+        const textNode = document.createTextNode(text);
+        if (range && event.currentTarget.contains(range.commonAncestorContainer)) {
+            range.deleteContents();
+            range.insertNode(textNode);
+        } else {
+            event.currentTarget.appendChild(textNode);
+        }
+
+        const nextRange = document.createRange();
+        nextRange.setStartAfter(textNode);
+        nextRange.collapse(true);
+        selection?.removeAllRanges();
+        selection?.addRange(nextRange);
+        updateReplyFromEditor(event.currentTarget);
+    }, [pushReplyHistory, updateReplyFromEditor]);
 
     const submitReply = useCallback((event: React.FormEvent) => {
         event.preventDefault();
@@ -3532,13 +4145,31 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         }
 
         pushReplyHistory();
+        pendingCaretOffsetRef.current = content.length;
         setReplyContent(content);
         setCursorPos(content.length);
-        requestAnimationFrame(() => {
-            replyInputRef.current?.focus();
-            replyInputRef.current?.setSelectionRange(content.length, content.length);
-        });
+        requestAnimationFrame(() => replyInputRef.current?.focus());
     }, [dialogueButtonMode, jumpToNotice, notice, onHandled, pushReplyHistory, sendReplyInBackground]);
+
+    const useVoiceInteraction = useCallback(async(event: React.MouseEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (dialogueButtonMode === DialogueButtonMode.Draft) {
+            await copyVoiceToReply();
+            return;
+        }
+
+        const file = await loadVoiceReply();
+        if (!file) return;
+
+        const shouldJumpOnReply = settings.store.jumpOnReply;
+        markNoticeRead(notice);
+        onHandled?.(notice.id, true, shouldJumpOnReply);
+        removeNotice(notice.id);
+        if (shouldJumpOnReply) jumpToNotice(notice);
+        sendReplyInBackground("", [], "Voice note reply failed in the background; mention restored.", shouldJumpOnReply ? 75 : 0, [file]);
+    }, [copyVoiceToReply, dialogueButtonMode, jumpToNotice, loadVoiceReply, notice, onHandled, sendReplyInBackground]);
 
     const deleteInteractionReply = useCallback((event: React.MouseEvent, id: string) => {
         event.preventDefault();
@@ -3546,8 +4177,8 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         settings.store.preselectedDialogues = getPreselectedDialogues().filter(dialogue => dialogue.id !== id);
     }, []);
 
-    const handleReplySelect = useCallback((event: React.SyntheticEvent<HTMLTextAreaElement>) => {
-        setCursorPos((event.target as HTMLTextAreaElement).selectionStart ?? 0);
+    const handleReplySelect = useCallback((event: React.SyntheticEvent<HTMLDivElement>) => {
+        setCursorPos(getReplyCursorOffset(event.currentTarget));
     }, []);
 
     const insertAutocompletedEmoji = useCallback((emoji: Emoji) => {
@@ -3558,12 +4189,10 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         const next = before + text + after;
         const nextCursor = before.length + text.length;
         pushReplyHistory();
+        pendingCaretOffsetRef.current = nextCursor;
         setReplyContent(next);
         setCursorPos(nextCursor);
-        requestAnimationFrame(() => {
-            replyInputRef.current?.focus();
-            replyInputRef.current?.setSelectionRange(nextCursor, nextCursor);
-        });
+        requestAnimationFrame(() => replyInputRef.current?.focus());
     }, [replyContent, cursorPos, emojiMatch, pushReplyHistory]);
 
     const insertAutocompletedPlaceholder = useCallback((placeholder: ReplyPlaceholderSuggestion, mode: "value" | "token" = "value") => {
@@ -3577,19 +4206,20 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         const nextCursor = before.length + replacement.length;
 
         pushReplyHistory();
+        pendingCaretOffsetRef.current = nextCursor;
         setReplyContent(next);
         setCursorPos(nextCursor);
-        requestAnimationFrame(() => {
-            replyInputRef.current?.focus();
-            replyInputRef.current?.setSelectionRange(nextCursor, nextCursor);
-        });
+        requestAnimationFrame(() => replyInputRef.current?.focus());
     }, [replyContent, placeholderMatch, pushReplyHistory]);
 
     const appendEmojiToReply = useCallback((emoji: Emoji) => {
+        const next = replyContent + emojiToInsertText(emoji);
         pushReplyHistory();
-        setReplyContent(prev => prev + emojiToInsertText(emoji));
+        pendingCaretOffsetRef.current = next.length;
+        setReplyContent(next);
+        setCursorPos(next.length);
         requestAnimationFrame(() => replyInputRef.current?.focus());
-    }, [pushReplyHistory]);
+    }, [pushReplyHistory, replyContent]);
 
     const openPlaceholderAutocomplete = useCallback(() => {
         const before = replyContent.slice(0, cursorPos);
@@ -3597,12 +4227,10 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         const nextCursor = before.length + 1;
 
         pushReplyHistory();
+        pendingCaretOffsetRef.current = nextCursor;
         setReplyContent(`${before}{${after}`);
         setCursorPos(nextCursor);
-        requestAnimationFrame(() => {
-            replyInputRef.current?.focus();
-            replyInputRef.current?.setSelectionRange(nextCursor, nextCursor);
-        });
+        requestAnimationFrame(() => replyInputRef.current?.focus());
     }, [cursorPos, pushReplyHistory, replyContent]);
 
     const getInteractionActions = useCallback(() =>
@@ -3619,7 +4247,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         actions[nextIndex].scrollIntoView({ block: "nearest", inline: "nearest" });
     }, [getInteractionActions]);
 
-    const handleReplyEscapeKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    const handleReplyEscapeKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
         if (event.key !== "Escape") return false;
 
         event.preventDefault();
@@ -3629,7 +4257,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         return true;
     }, [markCurrentNoticeRead]);
 
-    const handleReplyKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    const handleReplyKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
         if (handleReplyEscapeKeyDown(event)) return;
         if ((event.ctrlKey || event.metaKey) && event.key === "Tab") {
             event.preventDefault();
@@ -3645,6 +4273,21 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
             return;
         }
 
+        if ((event.key === "Backspace" || event.key === "Delete") && document.getSelection()?.isCollapsed) {
+            const currentCursor = getReplyCursorOffset(event.currentTarget);
+            const token = findReplyTokenAtCursor(replyContent, currentCursor, event.key);
+
+            if (token) {
+                const tokenStart = token.index ?? currentCursor;
+                event.preventDefault();
+                pushReplyHistory();
+                pendingCaretOffsetRef.current = tokenStart;
+                setReplyContent(replyContent.slice(0, tokenStart) + replyContent.slice(tokenStart + token[0].length));
+                setCursorPos(tokenStart);
+                return;
+            }
+        }
+
         if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
             event.stopPropagation();
@@ -3654,7 +4297,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
             }
 
             forceJumpOnSubmitRef.current = true;
-            event.currentTarget.form?.requestSubmit();
+            event.currentTarget.closest("form")?.requestSubmit();
             return;
         }
 
@@ -3708,6 +4351,10 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         if (event.key === "Tab") {
             event.preventDefault();
             event.stopPropagation();
+            if (hasReplayableVoiceMessage && !replyContent.trim() && !selectedSticker && replyFiles.length === 0) {
+                void copyVoiceToReply();
+                return;
+            }
             openPlaceholderAutocomplete();
             return;
         }
@@ -3715,9 +4362,9 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
             event.stopPropagation();
-            event.currentTarget.form?.requestSubmit();
+            event.currentTarget.closest("form")?.requestSubmit();
         }
-    }, [placeholderMatch, placeholderSuggestions, autocompleteSuggestions, autocompleteIndex, focusInteractionAction, handleReplyEscapeKeyDown, insertAutocompletedPlaceholder, insertAutocompletedEmoji, notice, openPlaceholderAutocomplete, replyContent, replyFiles, selectedSticker, undoReplyEdit]);
+    }, [placeholderMatch, placeholderSuggestions, autocompleteSuggestions, autocompleteIndex, copyVoiceToReply, focusInteractionAction, handleReplyEscapeKeyDown, hasReplayableVoiceMessage, insertAutocompletedPlaceholder, insertAutocompletedEmoji, notice, openPlaceholderAutocomplete, pushReplyHistory, replyContent, replyFiles, selectedSticker, undoReplyEdit]);
 
     const handleCardBlurCapture = useCallback((event: React.FocusEvent<HTMLDivElement>) => {
         const nextTarget = event.relatedTarget;
@@ -3882,6 +4529,12 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
                                 })}
                             </div>
                         )}
+                        {hasReplyPreview && notice.referencedAuthorName && (
+                            <div className="vc-mentions-box-replied-item">
+                                <span className="vc-mentions-box-replied-item-label">Replied item:</span>{" "}
+                                <span className="vc-mentions-box-replied-item-author">{notice.referencedAuthorName}</span>: {notice.referencedContent}
+                            </div>
+                        )}
                         <div className="vc-mentions-box-card-controls">
                             {hasReplyPreview && (
                                 <button
@@ -3893,7 +4546,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
                                     {isReplyExpanded ? "Hide reply chain" : `View reply chain${replyChain.length > 1 ? ` (${replyChain.length})` : ""}`}
                                 </button>
                             )}
-                            {interactionReplies.length > 0 && (
+                            {(interactionReplies.length > 0 || hasReplayableVoiceMessage) && (
                                 <button
                                     className="vc-mentions-box-card-control vc-mentions-box-card-control-primary"
                                     type="button"
@@ -3912,16 +4565,33 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
                         )}
                         {isInteractionExpanded && (
                             <div className="vc-mentions-box-interaction-panel" onClick={event => event.stopPropagation()}>
-                                <input
-                                    className="vc-mentions-box-interaction-search"
-                                    value={interactionSearch}
-                                    onChange={event => setInteractionSearch(event.currentTarget.value)}
-                                    onKeyDown={event => event.stopPropagation()}
-                                    placeholder="Search interactions…"
-                                    aria-label="Search interaction replies"
-                                />
+                                {interactionReplies.length > 0 && (
+                                    <input
+                                        className="vc-mentions-box-interaction-search"
+                                        value={interactionSearch}
+                                        onChange={event => setInteractionSearch(event.currentTarget.value)}
+                                        onKeyDown={event => event.stopPropagation()}
+                                        placeholder="Search interactions…"
+                                        aria-label="Search interaction replies"
+                                    />
+                                )}
                                 <div className="vc-mentions-box-dialogues" aria-label="Interaction replies">
-                                    {filteredInteractionReplies.length ? filteredInteractionReplies.map(reply => (
+                                    {hasReplayableVoiceMessage && (
+                                        <button
+                                            className="vc-mentions-box-dialogue-button"
+                                            type="button"
+                                            disabled={isCopyingVoice}
+                                            onClick={event => void useVoiceInteraction(event)}
+                                            title={dialogueButtonMode === DialogueButtonMode.Send
+                                                ? "Reply with this voice note"
+                                                : "Copy this voice note into the reply bar"}
+                                        >
+                                            {isCopyingVoice
+                                                ? "Copying voice note…"
+                                                : dialogueButtonMode === DialogueButtonMode.Send ? "Replay voice note" : "Copy voice note"}
+                                        </button>
+                                    )}
+                                    {filteredInteractionReplies.map(reply => (
                                         <button
                                             key={reply.id}
                                             className="vc-mentions-box-dialogue-button"
@@ -3933,7 +4603,8 @@ Right-click to delete this response`}
                                         >
                                             {reply.label}
                                         </button>
-                                    )) : (
+                                    ))}
+                                    {!hasReplayableVoiceMessage && filteredInteractionReplies.length === 0 && (
                                         <div className="vc-mentions-box-dialogue-empty">
                                             No interactions match “{interactionSearch.trim()}”
                                         </div>
@@ -4141,26 +4812,22 @@ Right-click to delete this response`}
                                 Remove
                             </button>
                         </div>
-                    )}
-                    <div className="vc-mentions-box-reply-input-wrap">
-                        {replyContent && !replyInputFocused && (
-                            <div className="vc-mentions-box-reply-rendered" aria-hidden>
-                                {renderMessageContent(replyContent, notice.channelId, notice.id)}
-                            </div>
-                        )}
-                        <textarea
+                   )}
+                   <div className="vc-mentions-box-reply-input-wrap">
+                       <div
                             ref={replyInputRef}
-                            rows={1}
-                            className={`vc-mentions-box-reply-input${replyContent && !replyInputFocused ? " vc-mentions-box-reply-input-rendered" : ""}`}
-                            value={replyContent}
-                            onChange={handleReplyChange}
+                            contentEditable
+                            suppressContentEditableWarning
+                            className="vc-mentions-box-reply-input"
+                            role="textbox"
+                            aria-multiline="true"
+                            data-placeholder={`Reply to ${notice.authorName}`}
+                            data-guild-id={notice.guildId ?? undefined}
+                            data-channel-id={notice.channelId}
+                            onInput={handleReplyChange}
                             onPaste={handleReplyPaste}
                             onSelect={handleReplySelect}
-                            onFocus={() => {
-                                setReplyInputFocused(true);
-                                setInteractionNavIndex(null);
-                            }}
-                            onBlur={() => setReplyInputFocused(false)}
+                            onFocus={() => setInteractionNavIndex(null)}
                             onKeyDownCapture={handleReplyEscapeKeyDown}
                             onKeyDown={handleReplyKeyDown}
                             aria-autocomplete="list"
@@ -4171,7 +4838,6 @@ Right-click to delete this response`}
                             aria-activedescendant={placeholderMatch && placeholderSuggestions[autocompleteIndex]
                                 ? getPlaceholderAutocompleteOptionId(placeholderSuggestions[autocompleteIndex].key)
                                 : autocompleteSuggestions[autocompleteIndex] ? `${EMOJI_AUTOCOMPLETE_ID}-${autocompleteIndex}` : undefined}
-                            placeholder={`Reply to ${notice.authorName}`}
                         />
                     </div>
                     <button
@@ -4312,12 +4978,12 @@ function MentionsBox({ embedded = false }: { embedded?: boolean; }) {
             if (!target) return;
 
             const focusTarget = focusReplyInput
-                ? target.querySelector<HTMLTextAreaElement>(".vc-mentions-box-reply-input")
+                ? target.querySelector<HTMLDivElement>(".vc-mentions-box-reply-input")
                 : null;
 
             if (focusTarget) {
                 focusTarget.focus({ preventScroll: true });
-                focusTarget.setSelectionRange(focusTarget.value.length, focusTarget.value.length);
+                setReplyCaretOffset(focusTarget, serializeReplyContent(focusTarget).length);
             } else {
                 target.focus({ preventScroll: true });
             }
@@ -4634,7 +5300,7 @@ export default definePlugin({
     description: "Shows clickable top-screen cards for recent mentions and jumps to the message when clicked.",
     tags: ["Chat", "Notifications"],
     authors: [Dean],
-    dependencies: ["ServerListAPI"],
+    dependencies: ["ServerListAPI", "VoiceMessages"],
     settings,
 
     toolboxActions() {
