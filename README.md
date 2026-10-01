@@ -14,6 +14,10 @@ MentionsBox is a simple Vencord user plugin that shows recent mentions in a clea
 - Dismiss notifications without jumping by clicking the `x`.
 - React to the mentioned message from the notification with your five most-used reaction emojis.
 - Reply to the mentioned message directly from the notification.
+- Restore the most recently dismissed mention with Ctrl+Z outside text-entry fields; undoing a sent reply restores its draft and edits the same message on resend.
+- Render Unicode emoji, custom emoji, and mentions as atomic inline items in the reply editor.
+- Show Discord's native favourite stickers in the reply picker; the Favourites tab is selected by default and stays read-only.
+- Selecting `{message.content}` explicitly sends the notice's exact original sticker when it contains one. Sticker sending follows Discord's normal availability rules; the optional clone fallback applies only when enabled and configured with a writable staging server.
 - Expand notifications to preview reply chains and new replies.
 - Renders Discord emoji, custom emoji, stickers, GIFs, and image previews inside mention notifications.
 - Adds Read more controls for longer message previews.
@@ -67,12 +71,20 @@ When a mentioned message is part of a reply chain, MentionsBox walks the linked 
 
 Mention content is rendered through Discord's parser so Discord emoji and custom emoji display inline instead of falling back to plain text. Supported stickers, GIF embeds, and image or GIF attachments render as compact media previews beneath the message text. MentionsBox also refreshes tracked messages in the background so late-loaded embeds, stickers, and GIF previews can populate without navigating to the message.
 
+The sticker picker reads Discord's locally available favorite sticker IDs from `UserSettingsProtoStore` without modifying Discord settings. If favorites have not loaded or cannot be resolved to previewable stickers, the tab is empty; favorite stickers in Discord's own picker to populate it. Original notice stickers are selected only by an explicit `{message.content}` reply action, never merely by opening a notice.
+
 ## Verification
 
-Run:
+Run the focused static and unit checks from the Vencord repository root:
 
 ```sh
-pnpm eslint src/userplugins/MentionsBox
+npx eslint src/userplugins/MentionsBox/index.tsx src/userplugins/MentionsBox/placeholders.ts src/userplugins/MentionsBox/PlaceholderAutocomplete.tsx src/userplugins/MentionsBox/manager.ts src/userplugins/MentionsBox/placeholders.test.ts src/userplugins/MentionsBox/replyHistory.ts src/userplugins/MentionsBox/replyHistory.test.ts
+npx tsx --test src/userplugins/MentionsBox/placeholders.test.ts src/userplugins/MentionsBox/replyHistory.test.ts
+node src/userplugins/MentionsBox/replyLifecycle.test.cjs
+node src/userplugins/MentionsBox/replyEditor.browser.test.cjs
+node src/userplugins/MentionsBox/replyEditor.component.test.cjs
+npx tsc --noEmit -p .
+pnpm build
 ```
 
-The full repo TypeScript check may fail if other local user plugins have unrelated type errors.
+The browser regression script extracts the production editor helpers from `index.tsx` with the installed TypeScript compiler and launches cached Playwright Chromium. The component regression script bundles the real `MentionCard` with esbuild and React 19, stubbing only Discord/Vencord dependencies; `--before` disables the caret and styling fixes in memory and is expected to fail. It saves before/after PNGs in the system temp directory. Override the cache defaults with `PLAYWRIGHT_MODULE_PATH`, `CHROMIUM_EXECUTABLE_PATH`, and (for the component script) `REACT_MODULES_PATH` pointing to a directory containing React 19 and react-dom. No authenticated Discord session is required; live message/sticker interactions still need client validation. The editor segments Unicode emoji by grapheme cluster, renders them with Discord's emoji URL utility, and serializes their exact Unicode sequence. Clone fallback for unavailable guild stickers additionally requires enabling the setting and configuring a writable staging guild. The full repo TypeScript check may report unrelated local user-plugin errors.

@@ -105,3 +105,17 @@ export function getReplyPlaceholderSuggestions(replacements: Record<string, stri
 export function resolveReplyPlaceholders(content: string, replacements: Record<string, string>) {
     return content.replace(/\{([^}]+)\}/g, (match, key: string) => replacements[key] ?? match);
 }
+
+export function usesMessageContentPlaceholder(content: string) {
+    return content.includes("{message.content}");
+}
+
+export function getReplyStickerId(content: string, selectedStickerId?: string | null, originalStickerId?: string | null) {
+    return usesMessageContentPlaceholder(content) && originalStickerId ? originalStickerId : selectedStickerId;
+}
+
+export function getNativeFavoriteStickerIds(frecency: unknown): string[] {
+    if (!frecency || typeof frecency !== "object") return [];
+    const ids = (frecency as { stickerIds?: unknown }).stickerIds;
+    return Array.isArray(ids) ? ids.map(String) : [];
+}

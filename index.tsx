@@ -11,19 +11,20 @@ import { addServerListElement, removeServerListElement, ServerListRenderPosition
 import { definePluginSettings } from "@api/Settings";
 import ErrorBoundary from "@components/ErrorBoundary";
 import { VoiceMessage } from "@plugins/voiceMessages";
+import { hasGuildFeature } from "@utils/discord";
 import definePlugin, { OptionType, type PluginAuthor } from "@utils/types";
-import type { CloudUpload as TCloudUpload, Emoji, MessageJSON, RenderModalProps, Sticker } from "@vencord/discord-types";
+import type { CloudUpload as TCloudUpload, Emoji, Guild, GuildSticker, MessageJSON, RenderModalProps, Sticker } from "@vencord/discord-types";
 import { ChannelType, CloudUploadPlatform, MessageFlags, MessageType, StickerFormatType } from "@vencord/discord-types/enums";
-import { findByPropsLazy, findCssClassesLazy, findLazy } from "@webpack";
+import { findByCodeLazy, findByPropsLazy, findCssClassesLazy, findLazy } from "@webpack";
 import {
     ChannelStore,
     Constants,
     createRoot,
     EmojiStore,
     FluxDispatcher,
+    Forms,
     GuildMemberStore,
     GuildStore,
-    IconUtils,
     Menu,
     MessageStore,
     Modal,
@@ -31,10 +32,13 @@ import {
     openMediaModal,
     openModal,
     Parser,
+    PermissionsBits,
+    PermissionStore,
     ReactDOM,
     ReadStateStore,
     RelationshipStore,
     RestAPI,
+    Select,
     SelectedChannelStore,
     StickersStore,
     useCallback,
@@ -43,6 +47,7 @@ import {
     useMemo,
     useRef,
     UserProfileActions,
+    UserSettingsProtoStore,
     UserStore,
     useState,
     useStateFromStores
@@ -51,14 +56,18 @@ import {
 import { filterAndSortNotices, getNextNoticeId, type MentionFilter } from "./manager";
 import { getPlaceholderAutocompleteOptionId, PLACEHOLDER_AUTOCOMPLETE_ID, PlaceholderAutocomplete, type ReplyAutocompletePosition } from "./PlaceholderAutocomplete";
 import {
+    getNativeFavoriteStickerIds,
     getReplyPlaceholderMatch,
     getReplyPlaceholderSuggestions,
+    getReplyStickerId,
     PLACEHOLDER_HELP,
     REPLY_PLACEHOLDERS,
     type ReplyPlaceholderMatch,
     type ReplyPlaceholderSuggestion,
-    resolveReplyPlaceholders
+    resolveReplyPlaceholders,
+    usesMessageContentPlaceholder
 } from "./placeholders";
+import { pushReplyHistory, replyMediaUnchanged, shouldEditReply } from "./replyHistory";
 
 interface MessageCreatePayload {
     channelId: string;
@@ -130,7 +139,7 @@ interface TypingStartPayload {
 type SelectedReplySticker = {
     id: string;
     name: string;
-    formatType: StickerFormatType;
+    formatType?: StickerFormatType;
 } | null;
 
 type MentionNoticeKind = "reaction" | "reply-to-mention" | "typing";
@@ -148,6 +157,8 @@ interface MentionNotice {
     channelName: string;
     guildName?: string;
     content: string;
+    messageText?: string;
+    originalSticker?: SelectedReplySticker;
     originalContent?: string;
     referencedContent?: string;
     referencedAuthorName?: string;
@@ -160,6 +171,17 @@ interface MentionNotice {
     deleted?: boolean;
     externalReactionDismissStartedAt?: number;
     externalReactionDismissDurationMs?: number;
+}
+
+interface NoticeUndoEntry {
+    notice: MentionNotice;
+    replyContent?: string;
+    stickerIds?: string[];
+    files?: ReplyFile[];
+    sentMessageId?: string;
+    sendFailed?: boolean;
+    sendPromise?: Promise<string>;
+    isEditing?: boolean;
 }
 
 interface MentionSourceOption {
@@ -233,6 +255,7 @@ const DEFAULT_PRESELECTED_DIALOGUES: PreselectedDialogue[] = [
 const DEFAULT_MESSAGE_COPYING_RULES: MessageCopyingRule[] = [];
 
 const EmojiUtils = findByPropsLazy("getURL", "getEmojiColors");
+const EmojiParser = findByPropsLazy("convertSurrogateToName");
 const CloudUpload: typeof TCloudUpload = findLazy(module => module.prototype?.trackUploadFinished);
 const MessageClasses = findCssClassesLazy("edited", "communicationDisabled", "isSystemMessage");
 
@@ -249,6 +272,212 @@ const enum DisplayLocation {
 const enum DialogueButtonMode {
     Send = "send",
     Draft = "draft"
+}
+
+const uploadEmoji = findByCodeLazy(".GUILD_EMOJIS(", "EMOJI_UPLOAD_START");
+const MAX_EMOJI_SIZE_BYTES = 256 * 1024;
+const MAX_STICKER_SIZE_BYTES = 512 * 1024;
+const PremiumTierStickerLimitMap = { 0: 5, 1: 15, 2: 30, 3: 60 } as const;
+const StickerExtMap = {
+    [StickerFormatType.PNG]: "png",
+    [StickerFormatType.APNG]: "png",
+    [StickerFormatType.LOTTIE]: "json",
+    [StickerFormatType.GIF]: "gif"
+} as const;
+type ClonedAsset = { type: "emoji" | "sticker"; id: string; guildId: string; };
+
+function getGuildMaxEmojiSlots(guild: Guild) {
+    return Math.max(
+        hasGuildFeature(guild, "MORE_EMOJI") ? 200 : 50,
+        50 + (guild.premiumFeatures?.additionalEmojiSlots ?? 0)
+    );
+}
+function getGuildMaxStickerSlots(guild: Guild) {
+    if (guild.features.has("MORE_STICKERS") && guild.premiumTier === 3) return 120;
+    return PremiumTierStickerLimitMap[guild.premiumTier] ?? PremiumTierStickerLimitMap[0];
+}
+function canCreateGuildExpressions(guild: Guild) {
+    const userId = UserStore.getCurrentUser()?.id;
+    return !!userId && (guild.ownerId === userId ||
+        (PermissionStore.getGuildPermissions({ id: guild.id }) & PermissionsBits.CREATE_GUILD_EXPRESSIONS) === PermissionsBits.CREATE_GUILD_EXPRESSIONS);
+}
+function hasEmojiCapacity(guild: Guild, count: number) {
+    return count < getGuildMaxEmojiSlots(guild);
+}
+function hasStickerCapacity(guild: Guild, count: number) {
+    return count < getGuildMaxStickerSlots(guild);
+}
+function CloneServerPicker({ setValue }: { setValue(newValue: string): void; }) {
+    settings.use(["cloneServerGuildId"]);
+    const selectedId = settings.store.cloneServerGuildId;
+    const options = Object.values(GuildStore.getGuilds())
+        .filter(canCreateGuildExpressions)
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map(guild => ({ label: guild.name, value: guild.id }));
+    return (
+        <div>
+            <Forms.FormTitle tag="h5">Clone Emojis &amp; Stickers Server</Forms.FormTitle>
+            <Select
+                options={options}
+                placeholder={options.length ? "Choose a server" : "No writable servers found"}
+                maxVisibleItems={8}
+                closeOnSelect={true}
+                select={(guildId: string) => {
+                    settings.store.cloneServerGuildId = guildId;
+                    setValue(guildId);
+                }}
+                isSelected={(guildId: string) => guildId === selectedId}
+                serialize={String}
+            />
+        </div>
+    );
+}
+function canUseExternal(channelId: string, permission: bigint) {
+    const channel = ChannelStore.getChannel(channelId);
+    return !channel || channel.isPrivate() || PermissionStore.can(permission, channel);
+}
+function canUseEmoteHere(guildId: string | undefined, animated: boolean, channelId: string, available = true) {
+    if (!guildId || !available) return false;
+    const channel = ChannelStore.getChannel(channelId);
+    const destinationGuildId = channel?.guild_id;
+    const hasNitro = (UserStore.getCurrentUser()?.premiumType ?? 0) > 0;
+    return (guildId === destinationGuildId && (!animated || hasNitro)) ||
+        (hasNitro && !!GuildStore.getGuild(guildId) && canUseExternal(channelId, PermissionsBits.USE_EXTERNAL_EMOJIS));
+}
+function canUseStickerHere(guildId: string | undefined, channelId: string, available = true) {
+    if (!guildId || !available) return false;
+    const destinationGuildId = ChannelStore.getChannel(channelId)?.guild_id;
+    return guildId === destinationGuildId ||
+        ((UserStore.getCurrentUser()?.premiumType ?? 0) > 1 && !!GuildStore.getGuild(guildId) && canUseExternal(channelId, PermissionsBits.USE_EXTERNAL_STICKERS));
+}
+async function fetchCloneBlob(urlForSize: (size: number) => string, maxBytes: number) {
+    for (let size = 4096; size >= 16; size /= 2) {
+        const response = await fetch(urlForSize(size));
+        if (!response.ok) throw new Error(`Failed to download expression: ${response.status}`);
+        const blob = await response.blob();
+        if (blob.size <= maxBytes) return blob;
+    }
+    throw new Error(`Expression exceeds upload limit of ${maxBytes} bytes`);
+}
+async function cloneEmojiToStaging(guildId: string, id: string, name: string) {
+    const blob = await fetchCloneBlob(
+        size => `${location.protocol}//${window.GLOBAL_ENV.CDN_HOST}/emojis/${id}.webp?size=${size}&lossless=true&animated=true`,
+        MAX_EMOJI_SIZE_BYTES
+    );
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+    });
+    const previousIds = new Set(EmojiStore.getGuildEmoji(guildId).map(emoji => emoji.id));
+    const result = await uploadEmoji({ guildId, name: name.split("~")[0], image: dataUrl });
+    const newId = result?.body?.id ?? result?.id ??
+        EmojiStore.getGuildEmoji(guildId).find(emoji => !previousIds.has(emoji.id) && emoji.name === name.split("~")[0])?.id;
+    if (!newId) throw new Error(`Emoji upload returned no id for ${name}`);
+    return String(newId);
+}
+async function cloneStickerToStaging(guildId: string, sticker: GuildSticker) {
+    const blob = await fetchCloneBlob(
+        size => `${window.GLOBAL_ENV.MEDIA_PROXY_ENDPOINT}/stickers/${sticker.id}.${StickerExtMap[sticker.format_type]}?size=${size}&lossless=true&animated=true`,
+        MAX_STICKER_SIZE_BYTES
+    );
+    const data = new FormData();
+    data.append("name", sticker.name);
+    data.append("tags", sticker.tags);
+    data.append("description", sticker.description);
+    data.append("file", blob);
+    const { body } = await RestAPI.post({ url: Constants.Endpoints.GUILD_STICKER_PACKS(guildId), body: data });
+    if (!body?.id) throw new Error(`Sticker upload returned no id for ${sticker.name}`);
+    try {
+        FluxDispatcher.dispatch({ type: "GUILD_STICKERS_CREATE_SUCCESS", guildId, sticker: { ...body, user: UserStore.getCurrentUser() } });
+    } catch (err) {
+        console.error("[MentionsBox] Sticker created, but local store update failed", err);
+    }
+    return String(body.id);
+}
+async function deleteClonedEmoji({ guildId, id }: ClonedAsset) {
+    await RestAPI.del({ url: `/guilds/${guildId}/emojis/${id}` });
+}
+async function deleteClonedSticker({ guildId, id }: ClonedAsset) {
+    await RestAPI.del({ url: `/guilds/${guildId}/stickers/${id}` });
+    FluxDispatcher.dispatch({ type: "GUILD_STICKERS_DELETE_SUCCESS", guildId, stickerId: id });
+}
+async function prepareCloneFallback(channelId: string, content: string, stickerIds: string[], guildId: string, clonedAssets: ClonedAsset[]) {
+    const guild = GuildStore.getGuild(guildId);
+    if (!guild || !canCreateGuildExpressions(guild)) throw new Error("Cannot create expressions in the configured staging server");
+
+    let sendContent = content;
+    const sendStickerIds = [...stickerIds];
+    const clonedEmojis = new Map<string, string>();
+    const clonedStickers = new Map<string, string>();
+    const originalEmojis = EmojiStore.getGuildEmoji(guildId);
+    const staticCount = originalEmojis.filter(emoji => !emoji.animated && !emoji.managed).length;
+    const animatedCount = originalEmojis.filter(emoji => emoji.animated && !emoji.managed).length;
+    const stickerCount = StickersStore.getStickersByGuildId(guildId)?.length ?? 0;
+    let staticReserved = 0;
+    let animatedReserved = 0;
+    let stickerReserved = 0;
+
+    for (const match of content.matchAll(/(?<!\\)<(a?):(\w+):(\d+)>/ig)) {
+        const [, animatedMarker, name, id] = match;
+        const existingId = clonedEmojis.get(id);
+        if (existingId) {
+            sendContent = sendContent.replaceAll(match[0], `<${animatedMarker ? "a" : ""}:${name}:${existingId}>`);
+            continue;
+        }
+        const emoji = EmojiStore.getCustomEmojiById(id);
+        const animated = emoji?.animated ?? animatedMarker === "a";
+        if (canUseEmoteHere(emoji?.guildId, animated, channelId, emoji?.available)) continue;
+        if (!canUseEmoteHere(guildId, animated, channelId)) {
+            console.error("[MentionsBox] Staging server emojis are not usable in this channel");
+            continue;
+        }
+        if (!hasEmojiCapacity(guild, animated ? animatedCount + animatedReserved : staticCount + staticReserved)) {
+            console.error("[MentionsBox] No staging server emoji slots available", animated ? "animated" : "static");
+            continue;
+        }
+
+        try {
+            const clonedId = await cloneEmojiToStaging(guildId, id, name);
+            clonedAssets.push({ type: "emoji", id: clonedId, guildId });
+            clonedEmojis.set(id, clonedId);
+            if (animated) animatedReserved++;
+            else staticReserved++;
+            sendContent = sendContent.replaceAll(match[0], `<${animated ? "a" : ""}:${name}:${clonedId}>`);
+        } catch (err) {
+            console.error("[MentionsBox] Failed to clone emoji", id, err);
+        }
+    }
+
+    for (const [index, id] of stickerIds.entries()) {
+        const existingId = clonedStickers.get(id);
+        if (existingId) {
+            sendStickerIds[index] = existingId;
+            continue;
+        }
+        try {
+            const sticker = StickersStore.getStickerById(id) ?? (await RestAPI.get({ url: Constants.Endpoints.STICKER(id) })).body as Sticker;
+            if ("pack_id" in sticker || canUseStickerHere(sticker.guild_id, channelId, sticker.available)) continue;
+            if (!canUseStickerHere(guildId, channelId)) {
+                console.error("[MentionsBox] Staging server stickers are not usable in this channel");
+                continue;
+            }
+            if (!hasStickerCapacity(guild, stickerCount + stickerReserved)) {
+                console.error("[MentionsBox] No staging server sticker slots available");
+                continue;
+            }
+
+            const clonedId = await cloneStickerToStaging(guildId, sticker as GuildSticker);
+            clonedAssets.push({ type: "sticker", id: clonedId, guildId });
+            clonedStickers.set(id, clonedId);
+            sendStickerIds[index] = clonedId;
+            stickerReserved++;
+        } catch (err) {
+            console.error("[MentionsBox] Failed to clone sticker", id, err);
+        }
+    }
+    return { sendContent, stickerIds: sendStickerIds };
 }
 
 const settings = definePluginSettings({
@@ -448,6 +677,17 @@ const settings = definePluginSettings({
         type: OptionType.CUSTOM,
         default: DEFAULT_MESSAGE_COPYING_RULES
     },
+    cloneServerGuildId: {
+        type: OptionType.COMPONENT,
+        description: "Server used to temporarily clone inaccessible emojis and stickers",
+        default: "",
+        component: props => <CloneServerPicker setValue={props.setValue} />
+    },
+    enableCloneFallback: {
+        type: OptionType.BOOLEAN,
+        description: "Clone inaccessible emojis/stickers into the staging server before sending a copied message, then delete them after sending",
+        default: false
+    },
     placeholderOrderSettings: {
         type: OptionType.COMPONENT,
         description: "Manage tab placeholder autocomplete order",
@@ -502,7 +742,7 @@ const settings = definePluginSettings({
             if (!Number.isInteger(minutes) || minutes < 1) return "Use a whole number of minutes greater than 0";
             return true;
         }
-    }
+    },
 }, {
     expirationMinutes: {
         disabled() { return this.store.neverExpire; }
@@ -512,6 +752,8 @@ const settings = definePluginSettings({
 let root: ReturnType<typeof createRoot> | null = null;
 let pluginStarted = false;
 let notices: MentionNotice[] = [];
+const discardedNoticeHistory: NoticeUndoEntry[] = [];
+const restoredReplyEntries = new Map<string, NoticeUndoEntry>();
 let pruneInterval: ReturnType<typeof setInterval> | null = null;
 let unreadLoadTimeout: ReturnType<typeof setTimeout> | null = null;
 let isLoadingUnreadMentions = false;
@@ -592,10 +834,24 @@ function getSnapshot() {
     return notices;
 }
 
-function setNotices(nextNotices: MentionNotice[]) {
-    if (notices === nextNotices) return;
+function setNotices(nextNotices: MentionNotice[], recordUndo = true) {
+    if (notices === nextNotices) return [];
+    const nextIds = new Set(nextNotices.map(notice => notice.id));
+    const removedEntries: NoticeUndoEntry[] = [];
+    for (const notice of notices) {
+        if (!nextIds.has(notice.id)) {
+            const restored = restoredReplyEntries.get(notice.id);
+            if (restored) restoredReplyEntries.delete(notice.id);
+            const entry = restored ? { ...restored, notice } : { notice };
+            if (recordUndo) {
+                pushReplyHistory(discardedNoticeHistory, entry);
+                removedEntries.push(entry);
+            }
+        }
+    }
     notices = nextNotices;
     emitChange();
+    return removedEntries;
 }
 
 function setNotificationsHidden(isHidden: boolean) {
@@ -672,10 +928,14 @@ function sortNoticesNewestFirst(nextNotices: MentionNotice[]) {
     return [...nextNotices].sort((a, b) => b.timestamp - a.timestamp);
 }
 
-function removeNotice(id: string) {
+function removeNotice(id: string, replyContent?: string, stickerIds?: string[], files?: ReplyFile[]) {
     dismissedNoticeIds.add(id);
     pendingReplyNoticeRemovalIds.delete(id);
-    setNotices(notices.filter(notice => notice.id !== id));
+    const entry = setNotices(notices.filter(notice => notice.id !== id)).find(item => item.notice.id === id);
+    if (entry && replyContent !== undefined) entry.replyContent = replyContent;
+    if (entry && stickerIds !== undefined) entry.stickerIds = stickerIds;
+    if (entry && files !== undefined) entry.files = files;
+    return entry;
 }
 
 function toggleSourceFilter() {
@@ -702,7 +962,7 @@ function removeNotices(noticesToRemove: readonly MentionNotice[]) {
     setNotices(notices.filter(notice => !ids.has(notice.id)));
 }
 
-function removeNoticeForMessage(messageId?: string, channelId?: string, shouldMarkRead = false) {
+function removeNoticeForMessage(messageId?: string, channelId?: string, shouldMarkRead = false, sentReply?: { id: string; content: string; }) {
     if (!messageId) return false;
 
     dismissedNoticeIds.add(messageId);
@@ -720,7 +980,15 @@ function removeNoticeForMessage(messageId?: string, channelId?: string, shouldMa
     });
 
     if (nextNotices.length === notices.length) return false;
-    setNotices(nextNotices);
+    const removedEntries = setNotices(nextNotices);
+    if (sentReply) {
+        for (const entry of removedEntries) {
+            if (!entry.sentMessageId) {
+                entry.sentMessageId = sentReply.id;
+                entry.replyContent = sentReply.content;
+            }
+        }
+    }
     return true;
 }
 
@@ -734,7 +1002,7 @@ function removeNoticeForReply(message: MessageJSON) {
         return true;
     }
 
-    return removeNoticeForMessage(messageId, reference?.channel_id, true);
+    return removeNoticeForMessage(messageId, reference?.channel_id, true, { id: message.id, content: message.content ?? "" });
 }
 
 function markNoticeDeleted(messageId?: string, channelId?: string) {
@@ -1044,11 +1312,11 @@ function trimStoredNotices() {
     if (nextNotices.length !== notices.length) setNotices(nextNotices);
 }
 
-function addNotice(notice: MentionNotice) {
+function addNotice(notice: MentionNotice, recordEvictions = true) {
     setNotices([
         notice,
         ...notices.filter(existing => existing.id !== notice.id)
-    ].slice(0, getStoredMentionsLimit()));
+    ].slice(0, getStoredMentionsLimit()), recordEvictions);
 }
 
 function isNoticePendingExternalReactionDismiss(notice: MentionNotice) {
@@ -1179,25 +1447,57 @@ function getAttachmentOriginalUrl(attachment: any) {
 function getStickerMediaUrl(sticker: any, size = 160) {
     const id = sticker?.id;
     const formatType = getStickerFormatType(sticker);
-    const ext = STICKER_FORMAT_EXTENSIONS[formatType] ?? "png";
-    if (!id || ext === "json") return null;
+    const ext = STICKER_FORMAT_EXTENSIONS[formatType ?? 0];
+    if (!id || !ext || ext === "json") return null;
 
     return `${window.GLOBAL_ENV.MEDIA_PROXY_ENDPOINT}/stickers/${id}.${ext}?size=${size}&lossless=true&animated=true`;
 }
 
-function getStickerFormatType(sticker: any): StickerFormatType {
+function getStickerFormatType(sticker: any): StickerFormatType | undefined {
     return (sticker?.format_type
         ?? sticker?.formatType
-        ?? (sticker?.id ? StickersStore.getStickerById(sticker.id)?.format_type : undefined)
-        ?? StickerFormatType.PNG) as StickerFormatType;
+        ?? (sticker?.id ? StickersStore.getStickerById(sticker.id)?.format_type : undefined)) as StickerFormatType | undefined;
+}
+
+function PreviewImage({ url, imageClass, fallbackClass, fallback, alt = "" }: {
+    url: string | null;
+    imageClass: string;
+    fallbackClass: string;
+    fallback: string;
+    alt?: string;
+}) {
+    const [failed, setFailed] = useState(false);
+    return url && !failed
+        ? <img className={imageClass} src={url} alt={alt} onError={() => setFailed(true)} />
+        : <span className={fallbackClass}>{fallback}</span>;
 }
 
 function isPreviewableSticker(sticker: any) {
-    return Boolean(sticker?.id) && getStickerFormatType(sticker) !== StickerFormatType.LOTTIE && Boolean(getStickerMediaUrl(sticker, 96));
+    return Boolean(sticker?.id);
 }
 
 function getStickerName(sticker: any) {
     return sticker?.name ?? "Sticker";
+}
+
+function getRestoredNoticeSticker(notice: MentionNotice): SelectedReplySticker {
+    const id = restoredReplyEntries.get(notice.id)?.stickerIds?.[0];
+    if (!id) return null;
+    if (notice.originalSticker?.id === id) return notice.originalSticker;
+    const sticker = StickersStore.getStickerById(id);
+    return { id, name: getStickerName(sticker), formatType: getStickerFormatType(sticker) };
+}
+
+function getOriginalSticker(...messages: any[]): SelectedReplySticker {
+    const sticker = messages.flatMap(message => [
+        ...(message?.stickerItems ?? message?.sticker_items ?? []),
+        ...(message?.stickers ?? [])
+    ])[0];
+    return sticker?.id ? {
+        id: sticker.id,
+        name: getStickerName(sticker),
+        formatType: getStickerFormatType(sticker)
+    } : null;
 }
 
 function getStickerSearchText(sticker: any) {
@@ -1257,8 +1557,10 @@ function collectMessageMedia(...messages: any[]): MessageMediaPreview[] {
     const seen = new Set<string>();
 
     function addMedia(item: MessageMediaPreview | null | undefined) {
-        if (!item?.url || seen.has(item.url)) return;
-        seen.add(item.url);
+        if (!item || (!item.url && item.kind !== "sticker")) return;
+        const key = item.url || `sticker:${item.id}`;
+        if (seen.has(key)) return;
+        seen.add(key);
         media.push(item);
     }
 
@@ -1364,8 +1666,8 @@ function collectMessageMedia(...messages: any[]): MessageMediaPreview[] {
         ...(message?.stickerItems ?? message?.sticker_items ?? []),
         ...(message?.stickers ?? [])
     ])) {
-        const url = getStickerMediaUrl(sticker);
-        if (!url) continue;
+        if (!sticker?.id) continue;
+        const url = getStickerMediaUrl(sticker) ?? "";
 
         addMedia({
             id: sticker.id,
@@ -1388,15 +1690,18 @@ function updateNoticeMessage(message: any, fallbackChannelId?: string) {
     const channelId = message?.channel_id ?? message?.channelId ?? fallbackChannelId;
     if (!messageId || !channelId || !notices.some(notice => notice.id === messageId && notice.channelId === channelId)) return;
 
+    const storedMessage = MessageStore.getMessage(channelId, messageId);
     const content = typeof message.content === "string" ? formatContent(message) : undefined;
-    const freshMedia = collectMessageMedia(message, MessageStore.getMessage(channelId, messageId));
-    if (content === undefined && !freshMedia.length) return;
+    const freshMedia = collectMessageMedia(message, storedMessage);
+    const hasStickerUpdate = [message.sticker_items, message.stickerItems, message.stickers].some(Array.isArray);
+    if (content === undefined && !freshMedia.length && !hasStickerUpdate) return;
 
+    const originalSticker = getOriginalSticker(message);
     setNotices(notices.map(notice => {
         if (notice.id !== messageId || notice.channelId !== channelId) return notice;
 
         const media = [...notice.media, ...freshMedia].filter((item, index, items) =>
-            items.findIndex(candidate => candidate.url === item.url) === index
+            items.findIndex(candidate => item.url ? candidate.url === item.url : candidate.kind === item.kind && candidate.id === item.id) === index
         );
         const contentChanged = content !== undefined && content !== notice.content;
         return {
@@ -1405,6 +1710,8 @@ function updateNoticeMessage(message: any, fallbackChannelId?: string) {
                 content,
                 originalContent: notice.originalContent ?? notice.content
             } : {}),
+            ...(typeof message.content === "string" ? { messageText: message.content.trim() } : {}),
+            originalSticker: hasStickerUpdate ? originalSticker : notice.originalSticker,
             media
         };
     }));
@@ -1425,7 +1732,7 @@ function renderMessageContent(content: string, channelId?: string, messageId?: s
 }
 
 function openMentionMedia(media: MessageMediaPreview) {
-    if (media.kind === "audio") return;
+    if (media.kind === "audio" || !media.url) return;
 
     openMediaModal({
         location: "MentionsBox",
@@ -1460,12 +1767,13 @@ function MessageMedia({ media, compact = false }: { media: MessageMediaPreview[]
                     className={`vc-mentions-box-media-item${item.kind === "sticker" ? " vc-mentions-box-media-sticker" : ""}`}
                     key={`${item.kind}-${item.id}`}
                     type="button"
+                    disabled={!item.url}
                     onClick={event => {
                         event.preventDefault();
                         event.stopPropagation();
                         openMentionMedia(item);
                     }}
-                    title={`Open ${item.filename ?? item.label}`}
+                    title={item.url ? `Open ${item.filename ?? item.label}` : item.filename ?? item.label}
                 >
                     {item.kind === "video" ? (
                         <video
@@ -1477,8 +1785,19 @@ function MessageMedia({ media, compact = false }: { media: MessageMediaPreview[]
                             loop={item.label === "GIF"}
                             playsInline
                         />
-                    ) : (
+                    ) : item.kind === "sticker" ? (
+                        <PreviewImage
+                            key={item.url}
+                            url={item.url}
+                            imageClass="vc-mentions-box-media-img"
+                            fallbackClass="vc-mentions-box-sticker-fallback"
+                            fallback={item.filename ?? "Sticker"}
+                            alt={item.filename ?? item.label}
+                        />
+                    ) : item.url ? (
                         <img className="vc-mentions-box-media-img" src={item.url} alt={item.filename ?? item.label} />
+                    ) : (
+                        <span className="vc-mentions-box-sticker-fallback">{item.filename ?? "Sticker"}</span>
                     )}
                     <span className="vc-mentions-box-media-label">{item.label}</span>
                 </button>
@@ -1502,8 +1821,14 @@ function StickerPickerTab({ active, onClick, children }: { active: boolean; onCl
 
 function MentionStickerPicker({ selectedId, onSelect, closePopout }: { selectedId: string | null; onSelect(sticker: SelectedReplySticker): void; closePopout(): void; }) {
     const [search, setSearch] = useState("");
-    const [selectedGroupId, setSelectedGroupId] = useState("default");
+    const [selectedGroupId, setSelectedGroupId] = useState("favorites");
     const [loadedDefaultStickers, setLoadedDefaultStickers] = useState<Sticker[]>(getDefaultReplyStickers());
+    const favoriteStickers = useStateFromStores([UserSettingsProtoStore, StickersStore], () => {
+        const ids = getNativeFavoriteStickerIds(UserSettingsProtoStore.frecencyWithoutFetchingLatest?.favoriteStickers);
+        return ids
+            .map(id => StickersStore.getStickerById(id))
+            .filter((sticker): sticker is Sticker => Boolean(sticker && isPreviewableSticker(sticker)));
+    });
 
     useEffect(() => {
         if (loadedDefaultStickers.length > 0) return;
@@ -1538,7 +1863,9 @@ function MentionStickerPicker({ selectedId, onSelect, closePopout }: { selectedI
     });
 
     const allStickers = stickerGroups.flatMap(group => group.stickers);
-    const visibleStickers = selectedGroupId === "all"
+    const visibleStickers = selectedGroupId === "favorites"
+        ? favoriteStickers
+        : selectedGroupId === "all"
         ? allStickers
         : stickerGroups.find(group => group.id === selectedGroupId)?.stickers ?? [];
     const filteredStickers = visibleStickers
@@ -1561,6 +1888,9 @@ function MentionStickerPicker({ selectedId, onSelect, closePopout }: { selectedI
                 </div>
             </div>
             <div className="vc-mentions-box-sticker-tabs">
+                <StickerPickerTab active={selectedGroupId === "favorites"} onClick={() => setSelectedGroupId("favorites")}>
+                    Favourites ({favoriteStickers.length})
+                </StickerPickerTab>
                 <StickerPickerTab active={selectedGroupId === "default"} onClick={() => setSelectedGroupId("default")}>
                     Default ({defaultStickers.length})
                 </StickerPickerTab>
@@ -1578,19 +1908,18 @@ function MentionStickerPicker({ selectedId, onSelect, closePopout }: { selectedI
                     <div className="vc-mentions-box-sticker-empty">Loading stickers...</div>
                 ) : filteredStickers.length === 0 ? (
                     <div className="vc-mentions-box-sticker-empty">
-                        {search.trim() ? `No results for "${search}".` : "No stickers in this tab."}
+                        {search.trim() ? `No results for "${search}".` : selectedGroupId === "favorites" ? "No available favorites. Favorite stickers in Discord's picker to show them here." : "No stickers in this tab."}
                     </div>
                 ) : filteredStickers.map(sticker => {
                     const formatType = getStickerFormatType(sticker);
                     const stickerUrl = getStickerMediaUrl(sticker, 96);
                     const selected = selectedId === sticker.id;
-
                     return (
-                        <button
+                        <div
                             key={sticker.id}
-                            type="button"
-                            className={`vc-mentions-box-sticker-button${selected ? " vc-mentions-box-sticker-button-selected" : ""}`}
-                            onClick={() => {
+                            className="vc-mentions-box-sticker-card"
+                        >
+                            <button type="button" className="vc-mentions-box-sticker-select" onClick={() => {
                                 onSelect(selected ? null : {
                                     id: sticker.id,
                                     name: getStickerName(sticker),
@@ -1600,14 +1929,11 @@ function MentionStickerPicker({ selectedId, onSelect, closePopout }: { selectedI
                             }}
                             title={getStickerName(sticker)}
                             aria-pressed={selected}
-                        >
-                            {stickerUrl ? (
-                                <img className="vc-mentions-box-sticker-img" src={stickerUrl} alt={getStickerName(sticker)} />
-                            ) : (
-                                <span className="vc-mentions-box-sticker-fallback">Sticker</span>
-                            )}
-                            <span className="vc-mentions-box-sticker-name">{getStickerName(sticker)}</span>
-                        </button>
+                            >
+                                <PreviewImage key={stickerUrl} url={stickerUrl} imageClass="vc-mentions-box-sticker-img" fallbackClass="vc-mentions-box-sticker-fallback" fallback={getStickerName(sticker)} alt={getStickerName(sticker)} />
+                                <span className="vc-mentions-box-sticker-name">{getStickerName(sticker)}</span>
+                            </button>
+                        </div>
                     );
                 })}
             </div>
@@ -1944,6 +2270,8 @@ function buildNoticeFromMessage(
         channelName: channel ? getChannelName(channel) : `<#${resolvedChannelId}>`,
         guildName: guild?.name,
         content: formatContent(displayMessage),
+        messageText: (displayMessage.content ?? message.content ?? "").trim(),
+        originalSticker: getOriginalSticker(displayMessage, message),
         referencedContent,
         referencedAuthorName,
         replyChain,
@@ -1982,6 +2310,7 @@ function buildNoticeFromReaction(payload: MessageReactionPayload): MentionNotice
         ?? reactor?.username
         ?? "Someone";
     const originalContent = formatContent(message as MessageJSON);
+    const originalSticker = getOriginalSticker(message);
     const reactions = (message.reactions ?? []).map((reaction: any) => ({
         count: reaction.count ?? 0,
         me: Boolean(reaction.me || reaction.me_burst),
@@ -2008,6 +2337,7 @@ function buildNoticeFromReaction(payload: MessageReactionPayload): MentionNotice
         channelName: channel ? getChannelName(channel) : `<#${channelId}>`,
         guildName: guild?.name,
         content: "reacted to your message",
+        ...(originalSticker ? { messageText: "", originalSticker } : {}),
         referencedContent: originalContent,
         referencedAuthorName: "You",
         replyChain: [],
@@ -2070,11 +2400,7 @@ function getEmojiKey(emoji: Emoji) {
 function getEmojiImageUrl(emoji: Emoji) {
     if (!emoji.id) return EmojiUtils.getURL(getUnicodeEmojiSurrogates(emoji));
 
-    return IconUtils.getEmojiURL({
-        id: emoji.id,
-        animated: emoji.animated,
-        size: 32
-    });
+    return `${location.protocol}//${window.GLOBAL_ENV.CDN_HOST}/emojis/${emoji.id}.webp?size=32&animated=true`;
 }
 
 function getUnicodeEmojiSurrogates(emoji: Emoji) {
@@ -2199,6 +2525,19 @@ async function sendReplyToNotice(notice: MentionNotice, content: string, sticker
     });
 
     rememberSentReplyChain(notice, response?.body ?? response);
+    return String(response?.body?.id ?? response?.id ?? "");
+}
+
+async function editReplyToNotice(notice: MentionNotice, content: string, entry: NoticeUndoEntry) {
+    const messageId = entry.sentMessageId ?? await entry.sendPromise;
+    if (!messageId && entry.sendFailed) return null;
+    if (!messageId) throw new Error("The original reply has no message ID");
+    await RestAPI.patch({
+        url: `/channels/${notice.channelId}/messages/${messageId}`,
+        body: { content, allowed_mentions: { parse: [], replied_user: true } }
+    });
+    entry.sentMessageId = messageId;
+    return messageId;
 }
 
 function wait(ms: number) {
@@ -2225,13 +2564,32 @@ function isSendCooldownError(error: any) {
 async function sendReplyToNoticeWithCooldownRetry(notice: MentionNotice, content: string, stickerIds: string[] = [], files: ReplyFile[] = []) {
     const uploads = await Promise.all(files.map(file => uploadReplyAttachment(file, notice.channelId)));
 
-    for (;;) {
+    const clonedAssets: ClonedAsset[] = [];
+    if (settings.store.enableCloneFallback && settings.store.cloneServerGuildId) {
         try {
-            await sendReplyToNotice(notice, content, stickerIds, uploads);
-            return;
-        } catch (error) {
-            if (!isSendCooldownError(error)) throw error;
-            await wait(SLOWMODE_REPLY_RETRY_DELAY_MS);
+            const prepared = await prepareCloneFallback(notice.channelId, content, stickerIds, settings.store.cloneServerGuildId, clonedAssets);
+            content = prepared.sendContent;
+            stickerIds = prepared.stickerIds;
+        } catch (err) {
+            console.error("[MentionsBox] Failed to prepare clone fallback", err);
+        }
+    }
+
+    try {
+        for (;;) {
+            try {
+                return await sendReplyToNotice(notice, content, stickerIds, uploads);
+            } catch (error) {
+                if (!isSendCooldownError(error)) throw error;
+                await wait(SLOWMODE_REPLY_RETRY_DELAY_MS);
+            }
+        }
+    } finally {
+        const deleted = await Promise.allSettled(clonedAssets.map(asset =>
+            asset.type === "emoji" ? deleteClonedEmoji(asset) : deleteClonedSticker(asset)
+        ));
+        for (const result of deleted) {
+            if (result.status === "rejected") console.error("[MentionsBox] Failed to delete cloned expression", result.reason);
         }
     }
 }
@@ -2462,6 +2820,24 @@ function consumeGlobalKeybind(event: KeyboardEvent) {
 const globalKeydownListener = (event: KeyboardEvent) => {
     if (isRecordingKeybind) return;
 
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z" && !event.shiftKey && !isTypingTarget(event.target)) {
+        const entry = discardedNoticeHistory.pop();
+        if (entry) {
+            event.preventDefault();
+            event.stopPropagation();
+            dismissedNoticeIds.delete(entry.notice.id);
+            entry.notice = {
+                ...entry.notice,
+                timestamp: Date.now(),
+                externalReactionDismissStartedAt: undefined,
+                externalReactionDismissDurationMs: undefined
+            };
+            restoredReplyEntries.set(entry.notice.id, entry);
+            addNotice(entry.notice, false);
+        }
+        return;
+    }
+
     if (shouldHandleGlobalKeybind(event, settings.store.hideToggleKeybind)) {
         consumeGlobalKeybind(event);
         toggleNotificationsHidden(true);
@@ -2634,7 +3010,7 @@ function getReplyPlaceholderReplacements(notice: MentionNotice): Record<string, 
         "channel.id": notice.channelId,
         "message.id": notice.id,
         "message.link": messageLink,
-        "message.content": notice.content,
+        "message.content": notice.messageText ?? notice.content,
         "reply.content": notice.referencedContent ?? "",
         "reply.author.name": notice.referencedAuthorName ?? "",
         "replied-user.name": notice.authorName,
@@ -3264,19 +3640,59 @@ function MessageCopyingSettings() {
 
 const MENTION_OR_EMOJI_TOKEN_REGEX = /<@!?\d+>|<a?:\w+:\d+>/g;
 
-function getReplyNodeRawText(node: ChildNode) {
+function getReplyNodeRawText(node: ChildNode): string {
     if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+    if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+        return Array.from(node.childNodes, (child, index) => {
+            const blockBreak = child instanceof HTMLElement && ["DIV", "P"].includes(child.tagName) && index > 0;
+            return `${blockBreak ? "\n" : ""}${getReplyNodeRawText(child)}`;
+        }).join("");
+    }
     if (!(node instanceof HTMLElement)) return node.textContent ?? "";
 
     const raw = node.getAttribute("data-raw");
     if (raw !== null) return raw;
     if (node.tagName === "BR") return "\n";
-    return node.textContent ?? "";
+    let result = "";
+    for (const [index, child] of Array.from(node.childNodes).entries()) {
+        if (child instanceof HTMLElement && ["DIV", "P"].includes(child.tagName) && index > 0) result += "\n";
+        result += getReplyNodeRawText(child);
+    }
+    return result;
 }
 
 function serializeReplyContent(container: HTMLElement) {
     if (container.childNodes.length === 1 && (container.firstChild as HTMLElement)?.tagName === "BR") return "";
-    return Array.from(container.childNodes, getReplyNodeRawText).join("");
+    return getReplyNodeRawText(container);
+}
+
+function getUnicodeEmoji(value: string) {
+    const name = EmojiParser.convertSurrogateToName(value, false);
+    const emoji = name ? EmojiParser.getByName(name) : null;
+    return emoji?.type === 0 && getEmojiImageUrl(emoji) ? emoji : null;
+}
+
+function appendReplyText(text: string, container: HTMLElement) {
+    const segments = new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text);
+    for (const { segment } of segments) {
+        const unicodeEmoji = getUnicodeEmoji(segment);
+        if (!unicodeEmoji) {
+            container.appendChild(document.createTextNode(segment));
+            continue;
+        }
+
+        const emoji = document.createElement("span");
+        emoji.contentEditable = "false";
+        emoji.dataset.raw = segment;
+        emoji.className = "vc-mentions-box-reply-token";
+        const image = document.createElement("img");
+        image.className = "vc-mentions-box-reply-token-emoji";
+        image.src = getEmojiImageUrl(unicodeEmoji);
+        image.alt = segment;
+        image.draggable = false;
+        emoji.appendChild(image);
+        container.appendChild(emoji);
+    }
 }
 
 function buildReplyEditorDom(raw: string, container: HTMLElement) {
@@ -3285,7 +3701,7 @@ function buildReplyEditorDom(raw: string, container: HTMLElement) {
     const appendText = (text: string) => {
         const lines = text.split("\n");
         lines.forEach((line, index) => {
-            if (line) container.appendChild(document.createTextNode(line));
+            if (line) appendReplyText(line, container);
             if (index < lines.length - 1) container.appendChild(document.createElement("br"));
         });
     };
@@ -3307,22 +3723,8 @@ function buildReplyEditorDom(raw: string, container: HTMLElement) {
             const mention = document.createElement("span");
             mention.contentEditable = "false";
             mention.dataset.raw = token;
-            mention.className = "vc-mentions-box-reply-token vc-mentions-box-reply-token-mention";
+            mention.className = "mention interactive vc-mentions-box-reply-token vc-mentions-box-reply-token-mention";
             mention.textContent = `@${displayName}`;
-            mention.style.cursor = "pointer";
-            mention.addEventListener("click", event => {
-                event.preventDefault();
-                event.stopPropagation();
-                UserProfileActions.openUserProfileModal({
-                    userId: id,
-                    guildId: container.dataset.guildId || undefined,
-                    channelId: container.dataset.channelId || undefined,
-                    analyticsLocation: {
-                        page: container.dataset.guildId ? "Guild Channel" : "DM Channel",
-                        section: "MentionsBox"
-                    }
-                });
-            });
             container.appendChild(mention);
         } else {
             const [, animated, name, id] = token.match(/^<(a?):(\w+):(\d+)>$/) ?? [];
@@ -3352,73 +3754,141 @@ function getReplyCursorOffset(container: HTMLElement) {
     if (!selection?.rangeCount || !anchorNode || (anchorNode !== container && !container.contains(anchorNode))) {
         return serializeReplyContent(container).length;
     }
-
-    const children = Array.from(container.childNodes);
-    if (anchorNode === container) {
-        return children.slice(0, anchorOffset).reduce((length, child) => length + getReplyNodeRawText(child).length, 0);
-    }
-
-    let directChild = anchorNode;
-    while (directChild.parentNode && directChild.parentNode !== container) directChild = directChild.parentNode;
-
-    let offset = 0;
-    for (const child of children) {
-        if (child !== directChild) {
-            offset += getReplyNodeRawText(child).length;
-            continue;
-        }
-
-        if (child.nodeType === Node.TEXT_NODE && anchorNode === child) {
-            return offset + Math.min(anchorOffset, child.textContent?.length ?? 0);
-        }
-
-        const caretRange = selection.getRangeAt(0).cloneRange();
-        const childRange = document.createRange();
-        caretRange.collapse(true);
-        childRange.selectNode(child);
-        return offset + (caretRange.compareBoundaryPoints(Range.START_TO_START, childRange) > 0
-            ? getReplyNodeRawText(child).length
-            : 0);
-    }
-
-    return offset;
+    const range = document.createRange();
+    range.selectNodeContents(container);
+    range.setEnd(anchorNode, anchorOffset);
+    return getReplyNodeRawText(range.cloneContents() as unknown as ChildNode).length;
 }
 
 function setReplyCaretOffset(container: HTMLElement, rawOffset: number) {
-    const children = Array.from(container.childNodes);
-    const target = Math.max(0, Math.min(rawOffset, serializeReplyContent(container).length));
     const range = document.createRange();
-    let consumed = 0;
-    let positioned = false;
-
-    for (const [index, child] of children.entries()) {
-        const { length } = getReplyNodeRawText(child);
-
-        if (target === consumed) {
-            range.setStart(container, index);
-            positioned = true;
-            break;
-        }
-
-        if (target < consumed + length) {
-            if (child.nodeType === Node.TEXT_NODE) {
-                range.setStart(child, target - consumed);
-            } else {
-                range.setStart(container, index + (target - consumed >= length / 2 ? 1 : 0));
-            }
-            positioned = true;
-            break;
-        }
-
-        consumed += length;
-    }
-
-    if (!positioned) range.setStart(container, children.length);
+    const point = getReplyDomPoint(container, rawOffset);
+    range.setStart(point.node, point.offset);
     range.collapse(true);
 
     const selection = document.getSelection();
     selection?.removeAllRanges();
     selection?.addRange(range);
+}
+
+function getReplyDomPoint(container: HTMLElement, rawOffset: number) {
+    const target = Math.max(0, Math.min(rawOffset, serializeReplyContent(container).length));
+    let consumed = 0;
+    let result = { node: container as Node, offset: container.childNodes.length };
+    const visit = (parent: Node): boolean => {
+        for (const [index, child] of Array.from(parent.childNodes).entries()) {
+            const before = { node: parent, offset: index };
+            const after = { node: parent, offset: index + 1 };
+            if (child instanceof HTMLElement && ["DIV", "P"].includes(child.tagName) && index > 0) {
+                if (target <= consumed + 1) {
+                    if (target === consumed) {
+                        result = before;
+                        return true;
+                    }
+                    consumed++;
+                    return visit(child) || (result = { node: child, offset: 0 }, true);
+                }
+                consumed++;
+            }
+            if (child.nodeType === Node.TEXT_NODE) {
+                const { length } = child.textContent ?? "";
+                if (target <= consumed + length) {
+                    result = { node: child, offset: target - consumed };
+                    return true;
+                }
+                consumed += length;
+            } else if (child instanceof HTMLElement && child.dataset.raw !== undefined) {
+                const { length } = child.dataset.raw;
+                if (target <= consumed + length) {
+                    result = target === consumed ? before : after;
+                    return true;
+                }
+                consumed += length;
+            } else if (child instanceof HTMLElement && child.tagName === "BR") {
+                if (target <= consumed + 1) {
+                    result = target === consumed ? before : after;
+                    return true;
+                }
+                consumed++;
+            } else if (visit(child)) return true;
+        }
+        return false;
+    };
+    visit(container);
+    return result;
+}
+
+function hasUnrenderedReplyToken(node: Node): boolean {
+    if (node.nodeType === Node.TEXT_NODE) {
+        const text = node.textContent ?? "";
+        if (text.match(MENTION_OR_EMOJI_TOKEN_REGEX)) return true;
+        return Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text))
+            .some(({ segment }) => Boolean(getUnicodeEmoji(segment)));
+    }
+    if (node instanceof HTMLElement && node.dataset.raw !== undefined) return false;
+    return Array.from(node.childNodes).some(child => hasUnrenderedReplyToken(child));
+}
+
+function setReplySelectionOffsets(container: HTMLElement, start: number, end: number) {
+    const startPoint = getReplyDomPoint(container, start);
+    const endPoint = getReplyDomPoint(container, end);
+    const range = document.createRange();
+    range.setStart(startPoint.node, startPoint.offset);
+    range.setEnd(endPoint.node, endPoint.offset);
+    const selection = document.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+}
+
+function insertReplyText(container: HTMLElement, start: number, end: number, text: string) {
+    container.focus();
+    setReplySelectionOffsets(container, start, end);
+    if (document.execCommand("insertText", false, text)) return true;
+
+    return false;
+}
+
+function getReplyEditorHtml(raw: string, guildId: string, channelId: string) {
+    const container = document.createElement("div");
+    container.dataset.guildId = guildId;
+    container.dataset.channelId = channelId;
+    buildReplyEditorDom(raw, container);
+    return container.innerHTML;
+}
+
+function insertReplyEditorHtml(container: HTMLElement, raw: string) {
+    const selection = document.getSelection();
+    const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    if (!range || !container.contains(range.startContainer) || !container.contains(range.endContainer)) return false;
+    const prefix = document.createRange();
+    prefix.selectNodeContents(container);
+    prefix.setEnd(range.startContainer, range.startOffset);
+    const start = getReplyNodeRawText(prefix.cloneContents() as unknown as ChildNode).length;
+    const inserted = document.execCommand("insertHTML", false, getReplyEditorHtml(raw, container.dataset.guildId ?? "", container.dataset.channelId ?? ""));
+    // Chromium can collapse the selection to the start when inserting atomic tokens.
+    if (inserted) setReplyCaretOffset(container, start + raw.length);
+    return inserted;
+}
+
+function insertReplyContent(container: HTMLElement, start: number, end: number, raw: string) {
+    container.focus();
+    setReplySelectionOffsets(container, start, end);
+    return insertReplyEditorHtml(container, raw);
+}
+
+function insertReplyContentAtSelection(container: HTMLElement, raw: string) {
+    container.focus();
+    return insertReplyEditorHtml(container, raw);
+}
+
+function replaceReplyEditorContent(container: HTMLElement, raw: string) {
+    container.focus();
+    const range = document.createRange();
+    range.selectNodeContents(container);
+    const selection = document.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    return insertReplyEditorHtml(container, raw);
 }
 
 function findReplyTokenAtCursor(content: string, cursorPos: number, key: "Backspace" | "Delete") {
@@ -3613,10 +4083,13 @@ function ReplyAutocompleteLayer({
                         }}
                         aria-selected={idx === selectedIndex}
                     >
-                        {imgUrl
-                            ? <img className="vc-mentions-box-autocomplete-img" src={imgUrl} alt="" />
-                            : <span className="vc-mentions-box-emoji-unicode">{getUnicodeEmojiSurrogates(emoji)}</span>
-                        }
+                        <PreviewImage
+                            key={imgUrl}
+                            url={imgUrl}
+                            imageClass="vc-mentions-box-autocomplete-img"
+                            fallbackClass={emoji.id ? "vc-mentions-box-emoji-fallback" : "vc-mentions-box-emoji-unicode"}
+                            fallback={emoji.id ? getEmojiLabel(emoji) : getUnicodeEmojiSurrogates(emoji)}
+                        />
                         <span className="vc-mentions-box-autocomplete-name">{getEmojiLabel(emoji)}</span>
                     </button>
                 );
@@ -3672,8 +4145,21 @@ function ExternalReactionExpiry({ noticeId, durationMs, paused }: { noticeId: st
     );
 }
 
+function getPickerPosition(button: HTMLButtonElement) {
+    const rect = button.getBoundingClientRect();
+    const pickerW = Math.min(500, window.innerWidth <= 560 ? window.innerWidth - 28 : window.innerWidth - 48);
+    const pickerH = Math.min(510, window.innerHeight - 72);
+    const below = rect.bottom + 6;
+    const above = rect.top - pickerH - 6;
+    const top = below + pickerH + 8 <= window.innerHeight
+        ? below
+        : above >= 8 ? above : Math.max(8, window.innerHeight - pickerH - 8);
+    const right = Math.max(8, Math.min(window.innerWidth - rect.right, window.innerWidth - pickerW - 8));
+    return { top, right };
+}
+
 function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?: (id: string, focusReplyInput?: boolean, focusAfterJump?: boolean) => void; }) {
-    const [replyContent, setReplyContent] = useState("");
+    const [replyContent, setReplyContent] = useState(() => restoredReplyEntries.get(notice.id)?.replyContent ?? "");
     const [isExpanded, setIsExpanded] = useState(() => settings.store.autoExpandReadMore);
     const [isReplyExpanded, setIsReplyExpanded] = useState(() => settings.store.autoViewReplyChain);
     const [isInteractionExpanded, setIsInteractionExpanded] = useState(false);
@@ -3688,13 +4174,13 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     const [showStickerPicker, setShowStickerPicker] = useState(false);
     const [emojiSearch, setEmojiSearch] = useState("");
     const [hoveredEmoji, setHoveredEmoji] = useState<Emoji | null>(null);
-    const [selectedSticker, setSelectedSticker] = useState<SelectedReplySticker>(null);
-    const [replyFiles, setReplyFiles] = useState<ReplyFile[]>([]);
+    const [selectedSticker, setSelectedSticker] = useState<SelectedReplySticker>(() => getRestoredNoticeSticker(notice));
+    const [replyFiles, setReplyFiles] = useState<ReplyFile[]>(() => restoredReplyEntries.get(notice.id)?.files ?? []);
     const [isCopyingVoice, setIsCopyingVoice] = useState(false);
     const [contentOverflows, setContentOverflows] = useState(false);
     const [interactionNavIndex, setInteractionNavIndex] = useState<number | null>(null);
-    const [pickerPos, setPickerPos] = useState<{ bottom: number; right: number; } | null>(null);
-    const [stickerPickerPos, setStickerPickerPos] = useState<{ bottom: number; right: number; } | null>(null);
+    const [pickerPos, setPickerPos] = useState<{ top: number; right: number; } | null>(null);
+    const [stickerPickerPos, setStickerPickerPos] = useState<{ top: number; right: number; } | null>(null);
     const cardRef = useRef<HTMLDivElement>(null);
     const replyInputRef = useRef<HTMLDivElement>(null);
     const emojiPickerRef = useRef<HTMLDivElement>(null);
@@ -3702,7 +4188,6 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     const stickerPickerRef = useRef<HTMLDivElement>(null);
     const stickerPickerTriggerRef = useRef<HTMLButtonElement>(null);
     const contentRef = useRef<HTMLDivElement>(null);
-    const replyHistoryRef = useRef<Array<{ content: string; cursorPos: number; }>>([]);
     const isLocalEditRef = useRef(false);
     const pendingCaretOffsetRef = useRef<number | null>(null);
     const forceJumpOnSubmitRef = useRef(false);
@@ -3726,6 +4211,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         .filter(dialogue => dialogue.label.trim() && dialogue.content.trim())
         .map(dialogue => ({
             ...dialogue,
+            copiesSticker: Boolean(notice.originalSticker && usesMessageContentPlaceholder(dialogue.content)),
             content: resolveInteractionReply(dialogue.content, notice)
         }));
     const filteredInteractionReplies = useMemo(() => {
@@ -3796,6 +4282,9 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
 
         if (isLocalEditRef.current) {
             isLocalEditRef.current = false;
+            const pendingCaretOffset = pendingCaretOffsetRef.current;
+            pendingCaretOffsetRef.current = null;
+            if (pendingCaretOffset !== null) setReplyCaretOffset(el, pendingCaretOffset);
             return;
         }
 
@@ -3907,20 +4396,83 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         markCurrentNoticeRead();
     }, [markCurrentNoticeRead]);
 
-    const sendReplyInBackground = useCallback((content: string, stickerIds: string[], failureMessage: string, delayMs: number, files: ReplyFile[] = []) => {
-        window.setTimeout(() => {
-            void sendReplyToNoticeWithCooldownRetry(notice, content, stickerIds, files)
-                .catch(error => {
-                    console.error("[MentionsBox] Failed to send reply in background", error);
-                    dismissedNoticeIds.delete(notice.id);
-                    addNotice({
-                        ...notice,
-                        timestamp: Date.now()
-                    });
-                    showKeybindSettingToast(failureMessage);
-                });
-        }, delayMs);
+    const sendReplyInBackground = useCallback((content: string, stickerIds: string[], failureMessage: string, delayMs: number, files: ReplyFile[] = [], undoEntry?: NoticeUndoEntry) => {
+        const sendPromise = new Promise<string>(resolve => window.setTimeout(() => {
+            void sendReplyToNoticeWithCooldownRetry(notice, content, stickerIds, files).then(messageId => {
+                if (undoEntry && messageId) {
+                    undoEntry.sentMessageId = messageId;
+                    undoEntry.sendFailed = false;
+                }
+                resolve(messageId);
+            }).catch(error => {
+                console.error("[MentionsBox] Failed to send reply in background", error);
+                if (undoEntry) {
+                    undoEntry.sendFailed = true;
+                    const historyIndex = discardedNoticeHistory.indexOf(undoEntry);
+                    if (historyIndex !== -1) discardedNoticeHistory.splice(historyIndex, 1);
+                    restoredReplyEntries.set(notice.id, undoEntry);
+                }
+                dismissedNoticeIds.delete(notice.id);
+                addNotice({ ...notice, timestamp: Date.now() }, false);
+                showKeybindSettingToast(failureMessage);
+                resolve("");
+            });
+        }, delayMs));
+        if (undoEntry) undoEntry.sendPromise = sendPromise;
     }, [notice]);
+
+    const dispatchReply = useCallback((content: string, stickerIds: string[], files: ReplyFile[], shouldJump: boolean, failureMessage: string) => {
+        const restored = restoredReplyEntries.get(notice.id);
+        const sendNewReply = () => {
+            markNoticeRead(notice);
+            onHandled?.(notice.id, true, shouldJump);
+            const undoEntry = removeNotice(notice.id, content, stickerIds, files);
+            if (undoEntry) undoEntry.sendFailed = false;
+            if (shouldJump) jumpToNotice(notice);
+            sendReplyInBackground(content, stickerIds, failureMessage, shouldJump ? 75 : 0, files, undoEntry);
+        };
+
+        if (!restored || !shouldEditReply(restored)) {
+            sendNewReply();
+            return;
+        }
+        if (restored.isEditing) return;
+
+        if (!replyMediaUnchanged(restored.stickerIds, stickerIds, restored.files, files)) {
+            showKeybindSettingToast("Changing stickers or files is not supported while editing a restored reply. Keep its original media, or dismiss it without resending.");
+            return;
+        }
+
+        if (content === restored.replyContent) {
+            markNoticeRead(notice);
+            onHandled?.(notice.id, true, shouldJump);
+            restored.isEditing = false;
+            removeNotice(notice.id, content, stickerIds, files);
+            if (shouldJump) jumpToNotice(notice);
+            return;
+        }
+
+        restored.isEditing = true;
+        void editReplyToNotice(notice, content, restored).then(messageId => {
+            if (!messageId) {
+                restored.sendFailed = true;
+                restored.isEditing = false;
+                showKeybindSettingToast("Reply edit failed; the original message was not duplicated. Retry or dismiss to keep the draft.");
+                return;
+            }
+
+            markNoticeRead(notice);
+            onHandled?.(notice.id, true, shouldJump);
+            restored.isEditing = false;
+            const editedEntry = removeNotice(notice.id, content, stickerIds, files);
+            if (editedEntry) editedEntry.sentMessageId = restored.sentMessageId;
+            if (shouldJump) jumpToNotice(notice);
+        }).catch(error => {
+            console.error("[MentionsBox] Failed to edit restored reply", error);
+            restored.isEditing = false;
+            showKeybindSettingToast("Reply edit failed; your draft and original message are still here. Retry to edit the same message.");
+        });
+    }, [jumpToNotice, notice, onHandled, sendReplyInBackground]);
 
     const loadVoiceReply = useCallback(async() => {
         if (!voiceMessage || isCopyingVoice) return null;
@@ -3949,49 +4501,50 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         requestAnimationFrame(() => replyInputRef.current?.focus());
     }, [loadVoiceReply]);
 
-    const pushReplyHistory = useCallback(() => {
-        const history = replyHistoryRef.current;
-        const last = history.at(-1);
-        if (last?.content === replyContent && last.cursorPos === cursorPos) return;
-
-        history.push({ content: replyContent, cursorPos });
-        if (history.length > 50) history.shift();
-    }, [cursorPos, replyContent]);
-
-    const undoReplyEdit = useCallback(() => {
-        const previous = replyHistoryRef.current.pop();
-        if (!previous) return false;
-
-        pendingCaretOffsetRef.current = previous.cursorPos;
-        setReplyContent(previous.content);
-        setCursorPos(previous.cursorPos);
-        requestAnimationFrame(() => replyInputRef.current?.focus());
-
-        return true;
-    }, []);
+    useEffect(() => {
+        setSelectedSticker(getRestoredNoticeSticker(notice));
+    }, [notice.id, notice.originalSticker?.id]);
 
     const updateReplyFromEditor = useCallback((container: HTMLDivElement) => {
+        if (container.dataset.normalizing === "true") return;
         const rawContent = serializeReplyContent(container);
         const rawCursorPos = getReplyCursorOffset(container);
-        const translated = translateEmojiShortcodes(rawContent, notice.guildId, rawCursorPos);
-        const hasUnrenderedToken = Array.from(container.childNodes).some(node =>
-            node.nodeType === Node.TEXT_NODE && Boolean(node.textContent?.match(MENTION_OR_EMOJI_TOKEN_REGEX))
-        );
-
+        const composing = container.dataset.composing === "true";
+        const translated = composing
+            ? { content: rawContent, cursorPos: rawCursorPos }
+            : translateEmojiShortcodes(rawContent, notice.guildId, rawCursorPos);
         if (replyFiles.some(isVoiceReplyFile)) setReplyFiles([]);
         pendingCaretOffsetRef.current = null;
-        if (translated.content === rawContent && !hasUnrenderedToken) {
-            isLocalEditRef.current = true;
-        } else {
-            pendingCaretOffsetRef.current = translated.cursorPos;
+        isLocalEditRef.current = translated.content !== replyContent;
+        const hasUnrenderedToken = hasUnrenderedReplyToken(container);
+        if (!composing && (translated.content !== rawContent || hasUnrenderedToken)) {
+            const nextContent = translated.content;
+            container.dataset.normalizing = "true";
+            const replaced = replaceReplyEditorContent(container, nextContent);
+            delete container.dataset.normalizing;
+            if (replaced) {
+                setReplyCaretOffset(container, translated.cursorPos);
+                pendingCaretOffsetRef.current = null;
+            }
         }
         setReplyContent(translated.content);
         setCursorPos(translated.cursorPos);
-
-        if (!rawContent && container.childNodes.length) container.replaceChildren();
-    }, [notice.guildId, replyFiles]);
+    }, [notice.guildId, replyContent, replyFiles]);
 
     const handleReplyChange = useCallback((event: React.FormEvent<HTMLDivElement>) => {
+        const inputEvent = event.nativeEvent as InputEvent;
+        if (inputEvent.inputType === "historyUndo" || inputEvent.inputType === "historyRedo") {
+            const raw = serializeReplyContent(event.currentTarget);
+            isLocalEditRef.current = raw !== replyContent;
+            setReplyContent(raw);
+            setCursorPos(getReplyCursorOffset(event.currentTarget));
+            return;
+        }
+        updateReplyFromEditor(event.currentTarget);
+    }, [replyContent, updateReplyFromEditor]);
+
+    const handleReplyCompositionEnd = useCallback((event: React.CompositionEvent<HTMLDivElement>) => {
+        delete event.currentTarget.dataset.composing;
         updateReplyFromEditor(event.currentTarget);
     }, [updateReplyFromEditor]);
 
@@ -4011,41 +4564,23 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         event.preventDefault();
         if (!text) return;
 
-        pushReplyHistory();
-        const selection = document.getSelection();
-        const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
-        const textNode = document.createTextNode(text);
-        if (range && event.currentTarget.contains(range.commonAncestorContainer)) {
-            range.deleteContents();
-            range.insertNode(textNode);
-        } else {
-            event.currentTarget.appendChild(textNode);
-        }
-
-        const nextRange = document.createRange();
-        nextRange.setStartAfter(textNode);
-        nextRange.collapse(true);
-        selection?.removeAllRanges();
-        selection?.addRange(nextRange);
+        if (!insertReplyContentAtSelection(event.currentTarget, text)) return;
         updateReplyFromEditor(event.currentTarget);
-    }, [pushReplyHistory, updateReplyFromEditor]);
+    }, [updateReplyFromEditor]);
 
     const submitReply = useCallback((event: React.FormEvent) => {
         event.preventDefault();
         event.stopPropagation();
 
         const content = resolveInteractionReply(replyContent.trim(), notice).trim();
-        const stickerIds = selectedSticker ? [selectedSticker.id] : [];
+        const stickerId = getReplyStickerId(replyContent, selectedSticker?.id, notice.originalSticker?.id);
+        const stickerIds = stickerId ? [stickerId] : [];
         const shouldJumpOnReply = forceJumpOnSubmitRef.current || settings.store.jumpOnReply;
         forceJumpOnSubmitRef.current = false;
         if (!content && stickerIds.length === 0 && replyFiles.length === 0) return;
 
-        markNoticeRead(notice);
-        onHandled?.(notice.id, true, shouldJumpOnReply);
-        removeNotice(notice.id);
-        if (shouldJumpOnReply) jumpToNotice(notice);
-        sendReplyInBackground(content, stickerIds, "Reply failed in the background; mention restored.", shouldJumpOnReply ? 75 : 0, replyFiles);
-    }, [jumpToNotice, notice, onHandled, replyContent, replyFiles, selectedSticker, sendReplyInBackground]);
+        dispatchReply(content, stickerIds, replyFiles, shouldJumpOnReply, "Reply failed in the background; mention restored.");
+    }, [dispatchReply, notice, replyContent, replyFiles, selectedSticker]);
 
     const reactToMention = useCallback((event: React.MouseEvent, emoji: Emoji, isReacted: boolean) => {
         event.preventDefault();
@@ -4056,18 +4591,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     const toggleEmojiPicker = useCallback((event: React.MouseEvent) => {
         event.preventDefault();
         event.stopPropagation();
-        const rect = (event.currentTarget as HTMLButtonElement).getBoundingClientRect();
-        const pickerW = Math.min(500, window.innerWidth - 48);
-        const pickerH = Math.min(510, window.innerHeight - 72);
-
-        let bottom = window.innerHeight - rect.top + 6;
-        bottom = Math.min(bottom, window.innerHeight - pickerH - 8);
-
-        let right = window.innerWidth - rect.right;
-        right = Math.min(right, window.innerWidth - pickerW - 8);
-        right = Math.max(0, right);
-
-        setPickerPos({ bottom, right });
+        setPickerPos(getPickerPosition(event.currentTarget as HTMLButtonElement));
         setEmojiSearch("");
         setHoveredEmoji(null);
         setShowStickerPicker(false);
@@ -4077,18 +4601,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     const toggleStickerPicker = useCallback((event: React.MouseEvent) => {
         event.preventDefault();
         event.stopPropagation();
-        const rect = (event.currentTarget as HTMLButtonElement).getBoundingClientRect();
-        const pickerW = Math.min(500, window.innerWidth - 48);
-        const pickerH = Math.min(510, window.innerHeight - 72);
-
-        let bottom = window.innerHeight - rect.top + 6;
-        bottom = Math.min(bottom, window.innerHeight - pickerH - 8);
-
-        let right = window.innerWidth - rect.right;
-        right = Math.min(right, window.innerWidth - pickerW - 8);
-        right = Math.max(0, right);
-
-        setStickerPickerPos({ bottom, right });
+        setStickerPickerPos(getPickerPosition(event.currentTarget as HTMLButtonElement));
         setShowEmojiPicker(false);
         setShowStickerPicker(value => !value);
     }, []);
@@ -4128,28 +4641,24 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         setIsInteractionExpanded(prev => !prev);
     }, []);
 
-    const useInteractionReply = useCallback((event: React.MouseEvent, content: string) => {
+    const useInteractionReply = useCallback((event: React.MouseEvent, content: string, copiesSticker: boolean) => {
         event.preventDefault();
         event.stopPropagation();
 
         if (dialogueButtonMode === DialogueButtonMode.Send) {
-            if (!content.trim()) return;
+            if (!content.trim() && !copiesSticker) return;
 
             const shouldJumpOnReply = settings.store.jumpOnReply;
-            markNoticeRead(notice);
-            onHandled?.(notice.id, true, shouldJumpOnReply);
-            removeNotice(notice.id);
-            if (shouldJumpOnReply) jumpToNotice(notice);
-            sendReplyInBackground(content.trim(), [], "Interaction reply failed in the background; mention restored.", shouldJumpOnReply ? 75 : 0);
+            dispatchReply(content.trim(), copiesSticker && notice.originalSticker ? [notice.originalSticker.id] : [], [], shouldJumpOnReply, "Interaction reply failed in the background; mention restored.");
             return;
         }
 
-        pushReplyHistory();
-        pendingCaretOffsetRef.current = content.length;
-        setReplyContent(content);
-        setCursorPos(content.length);
+        const input = replyInputRef.current;
+        if (!input || !insertReplyContent(input, 0, replyContent.length, content)) return;
+        updateReplyFromEditor(input);
+        setSelectedSticker(copiesSticker ? notice.originalSticker ?? null : null);
         requestAnimationFrame(() => replyInputRef.current?.focus());
-    }, [dialogueButtonMode, jumpToNotice, notice, onHandled, pushReplyHistory, sendReplyInBackground]);
+    }, [dialogueButtonMode, dispatchReply, notice, replyContent.length, updateReplyFromEditor]);
 
     const useVoiceInteraction = useCallback(async(event: React.MouseEvent) => {
         event.preventDefault();
@@ -4163,13 +4672,8 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         const file = await loadVoiceReply();
         if (!file) return;
 
-        const shouldJumpOnReply = settings.store.jumpOnReply;
-        markNoticeRead(notice);
-        onHandled?.(notice.id, true, shouldJumpOnReply);
-        removeNotice(notice.id);
-        if (shouldJumpOnReply) jumpToNotice(notice);
-        sendReplyInBackground("", [], "Voice note reply failed in the background; mention restored.", shouldJumpOnReply ? 75 : 0, [file]);
-    }, [copyVoiceToReply, dialogueButtonMode, jumpToNotice, loadVoiceReply, notice, onHandled, sendReplyInBackground]);
+        dispatchReply("", [], [file], settings.store.jumpOnReply, "Voice note reply failed in the background; mention restored.");
+    }, [copyVoiceToReply, dialogueButtonMode, dispatchReply, loadVoiceReply]);
 
     const deleteInteractionReply = useCallback((event: React.MouseEvent, id: string) => {
         event.preventDefault();
@@ -4181,57 +4685,54 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         setCursorPos(getReplyCursorOffset(event.currentTarget));
     }, []);
 
+    const handleReplyTokenClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+        const token = (event.target as HTMLElement).closest<HTMLElement>(".vc-mentions-box-reply-token-mention[data-raw]");
+        const userId = token?.dataset.raw?.match(/\d+/)?.[0];
+        if (!userId) return;
+        event.preventDefault();
+        event.stopPropagation();
+        UserProfileActions.openUserProfileModal({
+            userId,
+            guildId: notice.guildId ?? undefined,
+            channelId: notice.channelId,
+            analyticsLocation: { page: notice.guildId ? "Guild Channel" : "DM Channel", section: "MentionsBox" }
+        });
+    }, [notice.channelId, notice.guildId]);
+
     const insertAutocompletedEmoji = useCallback((emoji: Emoji) => {
         if (!emojiMatch) return;
         const text = emojiToInsertText(emoji);
-        const before = replyContent.slice(0, emojiMatch.startIndex);
-        const after = replyContent.slice(cursorPos);
-        const next = before + text + after;
-        const nextCursor = before.length + text.length;
-        pushReplyHistory();
-        pendingCaretOffsetRef.current = nextCursor;
-        setReplyContent(next);
-        setCursorPos(nextCursor);
+        const input = replyInputRef.current;
+        if (!input || !insertReplyContent(input, emojiMatch.startIndex, cursorPos, text)) return;
+        updateReplyFromEditor(input);
         requestAnimationFrame(() => replyInputRef.current?.focus());
-    }, [replyContent, cursorPos, emojiMatch, pushReplyHistory]);
+    }, [cursorPos, emojiMatch, updateReplyFromEditor]);
 
     const insertAutocompletedPlaceholder = useCallback((placeholder: ReplyPlaceholderSuggestion, mode: "value" | "token" = "value") => {
         if (!placeholderMatch) return;
 
         const replacement = mode === "token" ? placeholder.token : placeholder.resolvedValue;
         const trailingBrace = replyContent[placeholderMatch.endIndex] === "}" ? 1 : 0;
-        const before = replyContent.slice(0, placeholderMatch.startIndex);
-        const after = replyContent.slice(placeholderMatch.endIndex + trailingBrace);
-        const next = before + replacement + after;
-        const nextCursor = before.length + replacement.length;
-
-        pushReplyHistory();
-        pendingCaretOffsetRef.current = nextCursor;
-        setReplyContent(next);
-        setCursorPos(nextCursor);
+        const input = replyInputRef.current;
+        if (!input || !insertReplyContent(input, placeholderMatch.startIndex, placeholderMatch.endIndex + trailingBrace, replacement)) return;
+        updateReplyFromEditor(input);
+        if (placeholder.key === "message.content" && notice.originalSticker) setSelectedSticker(notice.originalSticker);
         requestAnimationFrame(() => replyInputRef.current?.focus());
-    }, [replyContent, placeholderMatch, pushReplyHistory]);
+    }, [replyContent, placeholderMatch, notice.originalSticker, updateReplyFromEditor]);
 
     const appendEmojiToReply = useCallback((emoji: Emoji) => {
-        const next = replyContent + emojiToInsertText(emoji);
-        pushReplyHistory();
-        pendingCaretOffsetRef.current = next.length;
-        setReplyContent(next);
-        setCursorPos(next.length);
+        const input = replyInputRef.current;
+        if (!input || !insertReplyContent(input, replyContent.length, replyContent.length, emojiToInsertText(emoji))) return;
+        updateReplyFromEditor(input);
         requestAnimationFrame(() => replyInputRef.current?.focus());
-    }, [pushReplyHistory, replyContent]);
+    }, [replyContent.length, updateReplyFromEditor]);
 
     const openPlaceholderAutocomplete = useCallback(() => {
-        const before = replyContent.slice(0, cursorPos);
-        const after = replyContent.slice(cursorPos);
-        const nextCursor = before.length + 1;
-
-        pushReplyHistory();
-        pendingCaretOffsetRef.current = nextCursor;
-        setReplyContent(`${before}{${after}`);
-        setCursorPos(nextCursor);
+        const input = replyInputRef.current;
+        if (!input || !insertReplyContent(input, cursorPos, cursorPos, "{")) return;
+        updateReplyFromEditor(input);
         requestAnimationFrame(() => replyInputRef.current?.focus());
-    }, [cursorPos, pushReplyHistory, replyContent]);
+    }, [cursorPos, updateReplyFromEditor]);
 
     const getInteractionActions = useCallback(() =>
         Array.from(cardRef.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [])
@@ -4267,10 +4768,19 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
             return;
         }
 
-        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z" && !event.shiftKey && undoReplyEdit()) {
-            event.preventDefault();
-            event.stopPropagation();
-            return;
+        if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey && document.getSelection()?.isCollapsed) {
+            const currentCursor = getReplyCursorOffset(event.currentTarget);
+            const token = Array.from(replyContent.matchAll(MENTION_OR_EMOJI_TOKEN_REGEX)).find(match => {
+                const start = match.index ?? 0;
+                return event.key === "ArrowLeft" ? start + match[0].length === currentCursor : start === currentCursor;
+            });
+            if (token) {
+                const nextCursor = (token.index ?? currentCursor) + (event.key === "ArrowRight" ? token[0].length : 0);
+                event.preventDefault();
+                setReplyCaretOffset(event.currentTarget, nextCursor);
+                setCursorPos(nextCursor);
+                return;
+            }
         }
 
         if ((event.key === "Backspace" || event.key === "Delete") && document.getSelection()?.isCollapsed) {
@@ -4280,10 +4790,9 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
             if (token) {
                 const tokenStart = token.index ?? currentCursor;
                 event.preventDefault();
-                pushReplyHistory();
-                pendingCaretOffsetRef.current = tokenStart;
-                setReplyContent(replyContent.slice(0, tokenStart) + replyContent.slice(tokenStart + token[0].length));
-                setCursorPos(tokenStart);
+                setReplySelectionOffsets(event.currentTarget, tokenStart, tokenStart + token[0].length);
+                document.execCommand("delete");
+                updateReplyFromEditor(event.currentTarget);
                 return;
             }
         }
@@ -4364,7 +4873,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
             event.stopPropagation();
             event.currentTarget.closest("form")?.requestSubmit();
         }
-    }, [placeholderMatch, placeholderSuggestions, autocompleteSuggestions, autocompleteIndex, copyVoiceToReply, focusInteractionAction, handleReplyEscapeKeyDown, hasReplayableVoiceMessage, insertAutocompletedPlaceholder, insertAutocompletedEmoji, notice, openPlaceholderAutocomplete, pushReplyHistory, replyContent, replyFiles, selectedSticker, undoReplyEdit]);
+    }, [placeholderMatch, placeholderSuggestions, autocompleteSuggestions, autocompleteIndex, copyVoiceToReply, focusInteractionAction, handleReplyEscapeKeyDown, hasReplayableVoiceMessage, insertAutocompletedPlaceholder, insertAutocompletedEmoji, notice, openPlaceholderAutocomplete, replyContent, replyFiles, selectedSticker]);
 
     const handleCardBlurCapture = useCallback((event: React.FocusEvent<HTMLDivElement>) => {
         const nextTarget = event.relatedTarget;
@@ -4519,10 +5028,13 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
                                             aria-pressed={isReacted}
                                             title={reaction.emoji.name}
                                         >
-                                            {imgUrl
-                                                ? <img src={imgUrl} alt="" className="vc-mentions-box-message-reaction-img" />
-                                                : <span className="vc-mentions-box-message-reaction-unicode">{reaction.emoji.name}</span>
-                                            }
+                                        <PreviewImage
+                                            key={imgUrl}
+                                            url={imgUrl}
+                                            imageClass="vc-mentions-box-message-reaction-img"
+                                            fallbackClass={reaction.emoji.id ? "vc-mentions-box-emoji-fallback" : "vc-mentions-box-message-reaction-unicode"}
+                                            fallback={reaction.emoji.id ? `:${reaction.emoji.name}:` : reaction.emoji.name}
+                                        />
                                             <span className="vc-mentions-box-message-reaction-count">{reaction.count}</span>
                                         </button>
                                     );
@@ -4557,12 +5069,167 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
                                 </button>
                             )}
                         </div>
-                        {isReplyExpanded && replyChain.length > 0 && <ReplyChain replies={replyChain} />}
-                        {isReplyExpanded && !replyChain.length && notice.referencedAuthorName && (
-                            <div className="vc-mentions-box-ref">
-                                ↩ <span className="vc-mentions-box-ref-author">{notice.referencedAuthorName}</span>: {notice.referencedContent}
-                            </div>
-                        )}
+                        <div className="vc-mentions-box-actions">
+                                {!isTypingNotice && <div className="vc-mentions-box-reactions" aria-label="Quick reactions">
+                                    {quickReactionEmojis.map(emoji => {
+                                        const imageUrl = getEmojiImageUrl(emoji);
+                                        const label = getEmojiLabel(emoji);
+                                        const isReacted = notice.reactedEmojiKeys.includes(getReactionKey(emoji));
+
+                                        return (
+                                            <button
+                                                key={getEmojiKey(emoji)}
+                                                type="button"
+                                                className={`vc-mentions-box-reaction${isReacted ? " vc-mentions-box-reaction-selected" : ""}`}
+                                                onClick={event => reactToMention(event, emoji, isReacted)}
+                                                aria-label={`${isReacted ? "Remove" : "React with"} ${label}`}
+                                                aria-pressed={isReacted}
+                                                title={`${isReacted ? "Remove" : "React with"} ${label}`}
+                                            >
+                                                <PreviewImage
+                                                    key={imageUrl}
+                                                    url={imageUrl}
+                                                    imageClass="vc-mentions-box-reaction-img"
+                                                    fallbackClass={emoji.id ? "vc-mentions-box-emoji-fallback" : "vc-mentions-box-reaction-unicode"}
+                                                    fallback={emoji.id ? label : getUnicodeEmojiSurrogates(emoji)}
+                                                />
+                                            </button>
+                                        );
+                                    })}
+                                    <>
+                                        <button
+                                            ref={pickerTriggerRef}
+                                            type="button"
+                                            className="vc-mentions-box-reaction vc-mentions-box-reaction-more"
+                                            aria-label="Add reaction"
+                                            title="Add reaction"
+                                            onClick={toggleEmojiPicker}
+                                        >
+                                            ☺
+                                        </button>
+                                        {showEmojiPicker && pickerPos && ReactDOM.createPortal(
+                                            <div
+                                                ref={emojiPickerRef}
+                                                className="vc-mentions-box-emoji-picker"
+                                                style={{ position: "fixed", top: pickerPos.top, right: pickerPos.right, zIndex: 10000 }}
+                                                onClick={event => event.stopPropagation()}
+                                            >
+                                                <div className="vc-mentions-box-emoji-picker-header">
+                                                    <div className="vc-mentions-box-emoji-search-wrap">
+                                                        <span className="vc-mentions-box-emoji-search-icon">🔍</span>
+                                                        <input
+                                                            className="vc-mentions-box-emoji-search"
+                                                            placeholder="Find the perfect emoji"
+                                                            value={emojiSearch}
+                                                            onChange={event => setEmojiSearch(event.currentTarget.value)}
+                                                            onKeyDown={event => event.stopPropagation()}
+                                                            autoFocus
+                                                        />
+                                                    </div>
+                                                </div>
+                                                <div className="vc-mentions-box-emoji-picker-body" style={{ gridTemplateColumns: "minmax(0, 1fr)" }}>
+                                                    <div className="vc-mentions-box-emoji-panel">
+                                                        {pickerEmojis.length === 0 ? (
+                                                            <div className="vc-mentions-box-emoji-empty">
+                                                                {emojiSearch.trim() ? `No results for "${emojiSearch}"` : "No emoji available"}
+                                                            </div>
+                                                        ) : (
+                                                            <>
+                                                                <div className="vc-mentions-box-emoji-heading">
+                                                                    {emojiSearch.trim() ? "Search results" : "Frequently used"}
+                                                                </div>
+                                                                <div className="vc-mentions-box-emoji-grid">
+                                                                    {pickerEmojis.map(emoji => {
+                                                                const imageUrl = getEmojiImageUrl(emoji);
+                                                                const label = getEmojiLabel(emoji);
+                                                                const emojiKey = getReactionKey(emoji);
+                                                                const isReacted = notice.reactedEmojiKeys.includes(emojiKey);
+
+                                                                return (
+                                                                    <button
+                                                                        key={getEmojiKey(emoji)}
+                                                                        type="button"
+                                                                        className={`vc-mentions-box-emoji-button${isReacted ? " vc-mentions-box-emoji-button-selected" : ""}`}
+                                                                        onClick={event => reactWithPickerEmoji(event, emoji, isReacted)}
+                                                                        onMouseEnter={() => setHoveredEmoji(emoji)}
+                                                                        onMouseLeave={() => setHoveredEmoji(null)}
+                                                                        onFocus={() => setHoveredEmoji(emoji)}
+                                                                        aria-label={`${isReacted ? "Remove" : "React with"} ${label}`}
+                                                                        title={label}
+                                                                    >
+                                                                        <PreviewImage
+                                                                            key={imageUrl}
+                                                                            url={imageUrl}
+                                                                            imageClass="vc-mentions-box-emoji-img"
+                                                                            fallbackClass={emoji.id ? "vc-mentions-box-emoji-fallback" : "vc-mentions-box-emoji-unicode"}
+                                                                            fallback={emoji.id ? label : getUnicodeEmojiSurrogates(emoji)}
+                                                                        />
+                                                                    </button>
+                                                                );
+                                                            })}
+                                                                </div>
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                {hoveredEmoji && (
+                                                    <div className="vc-mentions-box-emoji-footer">
+                                                        <PreviewImage
+                                                            key={getEmojiImageUrl(hoveredEmoji)}
+                                                            url={getEmojiImageUrl(hoveredEmoji)}
+                                                            imageClass="vc-mentions-box-emoji-footer-img"
+                                                            fallbackClass={hoveredEmoji.id ? "vc-mentions-box-emoji-fallback" : "vc-mentions-box-emoji-footer-unicode"}
+                                                            fallback={hoveredEmoji.id ? getEmojiLabel(hoveredEmoji) : getUnicodeEmojiSurrogates(hoveredEmoji)}
+                                                        />
+                                                        <span className="vc-mentions-box-emoji-footer-name">
+                                                            {hoveredEmoji.id ? getEmojiLabel(hoveredEmoji) : `:${getEmojiLabel(hoveredEmoji)}:`}
+                                                        </span>
+                                                    </div>
+                                                )}
+                                            </div>,
+                                            document.body
+                                        )}
+                                        <button
+                                            ref={stickerPickerTriggerRef}
+                                            type="button"
+                                            className={`vc-mentions-box-reaction vc-mentions-box-reaction-more vc-mentions-box-sticker-trigger${selectedSticker || showStickerPicker ? " vc-mentions-box-reaction-selected" : ""}`}
+                                            aria-label={selectedSticker ? `Selected sticker: ${selectedSticker.name}` : "Add sticker reply"}
+                                            title={selectedSticker ? `Sticker: ${selectedSticker.name}` : "Add sticker reply"}
+                                            aria-pressed={Boolean(selectedSticker || showStickerPicker)}
+                                            onClick={toggleStickerPicker}
+                                        >
+                                            ▣
+                                        </button>
+                                        {showStickerPicker && stickerPickerPos && ReactDOM.createPortal(
+                                            <div
+                                                ref={stickerPickerRef}
+                                                className="vc-mentions-box-sticker-picker"
+                                                style={{ position: "fixed", top: stickerPickerPos.top, right: stickerPickerPos.right, zIndex: 10000 }}
+                                                onClick={event => event.stopPropagation()}
+                                            >
+                                                <MentionStickerPicker
+                                                    selectedId={selectedSticker?.id ?? null}
+                                                    onSelect={setSelectedSticker}
+                                                    closePopout={() => setShowStickerPicker(false)}
+                                                />
+                                            </div>,
+                                            document.body
+                                        )}
+                                    </>
+                                </div>}
+                                <div className="vc-mentions-box-actions-right">
+                                    <button
+                                        className="vc-mentions-box-jump"
+                                        type="button"
+                                        onClick={clickJumpButton}
+                                    >
+                                        Jump
+                                    </button>
+                                    <button className="vc-mentions-box-dismiss" type="button" onClick={dismissNotice} aria-label="Mark mention as read">
+                                        Mark as read
+                                    </button>
+                                </div>
+                        </div>
                         {isInteractionExpanded && (
                             <div className="vc-mentions-box-interaction-panel" onClick={event => event.stopPropagation()}>
                                 {interactionReplies.length > 0 && (
@@ -4596,7 +5263,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
                                             key={reply.id}
                                             className="vc-mentions-box-dialogue-button"
                                             type="button"
-                                            onClick={event => useInteractionReply(event, reply.content)}
+                                            onClick={event => useInteractionReply(event, reply.content, reply.copiesSticker)}
                                             onContextMenu={event => deleteInteractionReply(event, reply.id)}
                                             title={`${reply.content}
 Right-click to delete this response`}
@@ -4612,157 +5279,12 @@ Right-click to delete this response`}
                                 </div>
                             </div>
                         )}
-                    </div>
-                    <div className="vc-mentions-box-actions">
-                        {!isTypingNotice && <div className="vc-mentions-box-reactions" aria-label="Quick reactions">
-                            {quickReactionEmojis.map(emoji => {
-                                const imageUrl = getEmojiImageUrl(emoji);
-                                const label = getEmojiLabel(emoji);
-                                const isReacted = notice.reactedEmojiKeys.includes(getReactionKey(emoji));
-
-                                return (
-                                    <button
-                                        key={getEmojiKey(emoji)}
-                                        type="button"
-                                        className={`vc-mentions-box-reaction${isReacted ? " vc-mentions-box-reaction-selected" : ""}`}
-                                        onClick={event => reactToMention(event, emoji, isReacted)}
-                                        aria-label={`${isReacted ? "Remove" : "React with"} ${label}`}
-                                        aria-pressed={isReacted}
-                                        title={`${isReacted ? "Remove" : "React with"} ${label}`}
-                                    >
-                                        {imageUrl ? (
-                                            <img className="vc-mentions-box-reaction-img" src={imageUrl} alt="" />
-                                        ) : (
-                                            <span className="vc-mentions-box-reaction-unicode">{getEmojiLabel(emoji)}</span>
-                                        )}
-                                    </button>
-                                );
-                            })}
-                            <>
-                                <button
-                                    ref={pickerTriggerRef}
-                                    type="button"
-                                    className="vc-mentions-box-reaction vc-mentions-box-reaction-more"
-                                    aria-label="Add reaction"
-                                    title="Add reaction"
-                                    onClick={toggleEmojiPicker}
-                                >
-                                    ☺
-                                </button>
-                                {showEmojiPicker && pickerPos && ReactDOM.createPortal(
-                                    <div
-                                        ref={emojiPickerRef}
-                                        className="vc-mentions-box-emoji-picker"
-                                        style={{ position: "fixed", bottom: pickerPos.bottom, right: pickerPos.right, zIndex: 10000 }}
-                                        onClick={event => event.stopPropagation()}
-                                    >
-                                        <div className="vc-mentions-box-emoji-picker-header">
-                                            <div className="vc-mentions-box-emoji-search-wrap">
-                                                <span className="vc-mentions-box-emoji-search-icon">🔍</span>
-                                                <input
-                                                    className="vc-mentions-box-emoji-search"
-                                                    placeholder="Find the perfect emoji"
-                                                    value={emojiSearch}
-                                                    onChange={event => setEmojiSearch(event.currentTarget.value)}
-                                                    onKeyDown={event => event.stopPropagation()}
-                                                    autoFocus
-                                                />
-                                            </div>
-                                        </div>
-                                        <div className="vc-mentions-box-emoji-picker-body" style={{ gridTemplateColumns: "minmax(0, 1fr)" }}>
-                                            <div className="vc-mentions-box-emoji-panel">
-                                                {pickerEmojis.length === 0 ? (
-                                                    <div className="vc-mentions-box-emoji-empty">
-                                                        {emojiSearch.trim() ? `No results for "${emojiSearch}"` : "No emoji available"}
-                                                    </div>
-                                                ) : (
-                                                    <>
-                                                        <div className="vc-mentions-box-emoji-heading">
-                                                            {emojiSearch.trim() ? "Search results" : "Frequently used"}
-                                                        </div>
-                                                        <div className="vc-mentions-box-emoji-grid">
-                                                            {pickerEmojis.map(emoji => {
-                                                        const imageUrl = getEmojiImageUrl(emoji);
-                                                        const label = getEmojiLabel(emoji);
-                                                        const emojiKey = getReactionKey(emoji);
-                                                        const isReacted = notice.reactedEmojiKeys.includes(emojiKey);
-
-                                                        return (
-                                                            <button
-                                                                key={getEmojiKey(emoji)}
-                                                                type="button"
-                                                                className={`vc-mentions-box-emoji-button${isReacted ? " vc-mentions-box-emoji-button-selected" : ""}`}
-                                                                onClick={event => reactWithPickerEmoji(event, emoji, isReacted)}
-                                                                onMouseEnter={() => setHoveredEmoji(emoji)}
-                                                                onMouseLeave={() => setHoveredEmoji(null)}
-                                                                onFocus={() => setHoveredEmoji(emoji)}
-                                                                aria-label={`${isReacted ? "Remove" : "React with"} ${label}`}
-                                                                title={label}
-                                                            >
-                                                                {imageUrl
-                                                                    ? <img className="vc-mentions-box-emoji-img" src={imageUrl} alt="" />
-                                                                    : <span className="vc-mentions-box-emoji-unicode">{getUnicodeEmojiSurrogates(emoji)}</span>
-                                                                }
-                                                            </button>
-                                                        );
-                                                    })}
-                                                        </div>
-                                                    </>
-                                                )}
-                                            </div>
-                                        </div>
-                                        {hoveredEmoji && (
-                                            <div className="vc-mentions-box-emoji-footer">
-                                                {getEmojiImageUrl(hoveredEmoji)
-                                                    ? <img className="vc-mentions-box-emoji-footer-img" src={getEmojiImageUrl(hoveredEmoji)} alt="" />
-                                                    : <span className="vc-mentions-box-emoji-footer-unicode">{getUnicodeEmojiSurrogates(hoveredEmoji)}</span>
-                                                }
-                                                <span className="vc-mentions-box-emoji-footer-name">
-                                                    {hoveredEmoji.id ? getEmojiLabel(hoveredEmoji) : `:${getEmojiLabel(hoveredEmoji)}:`}
-                                                </span>
-                                            </div>
-                                        )}
-                                    </div>,
-                                    document.body
-                                )}
-                                <button
-                                    ref={stickerPickerTriggerRef}
-                                    type="button"
-                                    className={`vc-mentions-box-reaction vc-mentions-box-reaction-more vc-mentions-box-sticker-trigger${selectedSticker || showStickerPicker ? " vc-mentions-box-reaction-selected" : ""}`}
-                                    aria-label={selectedSticker ? `Selected sticker: ${selectedSticker.name}` : "Add sticker reply"}
-                                    title={selectedSticker ? `Sticker: ${selectedSticker.name}` : "Add sticker reply"}
-                                    aria-pressed={Boolean(selectedSticker || showStickerPicker)}
-                                    onClick={toggleStickerPicker}
-                                >
-                                    ▣
-                                </button>
-                                {showStickerPicker && stickerPickerPos && ReactDOM.createPortal(
-                                    <div
-                                        ref={stickerPickerRef}
-                                        className="vc-mentions-box-sticker-picker"
-                                        style={{ position: "fixed", bottom: stickerPickerPos.bottom, right: stickerPickerPos.right, zIndex: 10000 }}
-                                        onClick={event => event.stopPropagation()}
-                                    >
-                                        <MentionStickerPicker
-                                            selectedId={selectedSticker?.id ?? null}
-                                            onSelect={setSelectedSticker}
-                                            closePopout={() => setShowStickerPicker(false)}
-                                        />
-                                    </div>,
-                                    document.body
-                                )}
-                            </>
-                        </div>}
-                        <button
-                            className="vc-mentions-box-jump"
-                            type="button"
-                            onClick={clickJumpButton}
-                        >
-                            Jump
-                        </button>
-                        <button className="vc-mentions-box-dismiss" type="button" onClick={dismissNotice} aria-label="Mark mention as read">
-                            Mark as read
-                        </button>
+                        {isReplyExpanded && replyChain.length > 0 && <ReplyChain replies={replyChain} />}
+                        {isReplyExpanded && !replyChain.length && notice.referencedAuthorName && (
+                            <div className="vc-mentions-box-ref">
+                                ↩ <span className="vc-mentions-box-ref-author">{notice.referencedAuthorName}</span>: {notice.referencedContent}
+                            </div>
+                        )}
                     </div>
                 </div>
                 <form className="vc-mentions-box-reply" onSubmit={submitReply} onClick={event => event.stopPropagation()}>
@@ -4791,15 +5313,14 @@ Right-click to delete this response`}
                     )}
                     {selectedSticker && (
                         <div className="vc-mentions-box-selected-sticker" onClick={event => event.stopPropagation()}>
-                            {getStickerMediaUrl({ id: selectedSticker.id, format_type: selectedSticker.formatType }, 64) ? (
-                                <img
-                                    className="vc-mentions-box-selected-sticker-img"
-                                    src={getStickerMediaUrl({ id: selectedSticker.id, format_type: selectedSticker.formatType }, 64)!}
-                                    alt={selectedSticker.name}
-                                />
-                            ) : (
-                                <span className="vc-mentions-box-selected-sticker-fallback">Sticker</span>
-                            )}
+                            <PreviewImage
+                                key={selectedSticker.id}
+                                url={getStickerMediaUrl({ id: selectedSticker.id, format_type: selectedSticker.formatType }, 64)}
+                                imageClass="vc-mentions-box-selected-sticker-img"
+                                fallbackClass="vc-mentions-box-selected-sticker-fallback"
+                                fallback={selectedSticker.name}
+                                alt={selectedSticker.name}
+                            />
                             <div className="vc-mentions-box-selected-sticker-copy">
                                 <span className="vc-mentions-box-selected-sticker-name">{selectedSticker.name}</span>
                                 <span className="vc-mentions-box-selected-sticker-hint">Sticker will be sent as a reply.</span>
@@ -4825,6 +5346,9 @@ Right-click to delete this response`}
                             data-guild-id={notice.guildId ?? undefined}
                             data-channel-id={notice.channelId}
                             onInput={handleReplyChange}
+                            onCompositionStart={event => { event.currentTarget.dataset.composing = "true"; }}
+                            onCompositionEnd={handleReplyCompositionEnd}
+                            onClick={handleReplyTokenClick}
                             onPaste={handleReplyPaste}
                             onSelect={handleReplySelect}
                             onFocus={() => setInteractionNavIndex(null)}
@@ -5360,7 +5884,9 @@ export default definePlugin({
         mentionBoxReactionMessageIds.clear();
         keywordNotifierMentionIds.clear();
         setUnreadMentionsLoading(false);
-        setNotices([]);
+        setNotices([], false);
+        discardedNoticeHistory.length = 0;
+        restoredReplyEntries.clear();
         removeServerListElement(ServerListRenderPosition.Above, renderMentionsSectionButton);
         unmountRoot();
     },
