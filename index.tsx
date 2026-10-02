@@ -46,11 +46,11 @@ import {
     useLayoutEffect,
     useMemo,
     useRef,
-    UserProfileActions,
     UserSettingsProtoStore,
     UserStore,
     useState,
-    useStateFromStores
+    useStateFromStores,
+    UserUtils
 } from "@webpack/common";
 
 import { filterAndSortNotices, getNextNoticeId, type MentionFilter } from "./manager";
@@ -1390,6 +1390,20 @@ function getAuthorName(message: MessageJSON | any) {
         ?? "Unknown User";
 }
 
+// Vencord's UserProfileActions finder also requires closeUserProfileModal, which Discord moved out of this module.
+const UserProfileModal = findByPropsLazy("openUserProfileModal");
+
+async function openProfile(userId: string, notice: { guildId?: string | null; channelId: string; }) {
+    // Like Vencord's openUserProfile: ensure the user is in UserStore before opening the modal.
+    await UserUtils.getUser(userId).catch(() => { });
+    UserProfileModal.openUserProfileModal({
+        userId,
+        guildId: notice.guildId ?? undefined,
+        channelId: notice.channelId,
+        sourceAnalyticsLocations: ["MentionsBox"]
+    });
+}
+
 function buildRawAvatarUrl(rawAuthor: any, size = 64): string | undefined {
     if (!rawAuthor?.id) return undefined;
 
@@ -2614,7 +2628,18 @@ function isUnreadMentionMessage(message: any, channelId = message?.channel_id ??
     return ReadStateStore.hasUnread(channelId) && isMessageAfterAck(message, channelId);
 }
 
+function getMentionLoadCutoff() {
+    if (settings.store.neverExpire) return 0;
+    return Date.now() - (Number(settings.store.expirationMinutes) || DEFAULT_EXPIRATION_MINUTES) * 60_000;
+}
+
+function isMessageTooOld(message: any, cutoff: number) {
+    const time = Date.parse(message?.timestamp ?? "");
+    return cutoff > 0 && Number.isFinite(time) && time < cutoff;
+}
+
 async function fetchRecentMentionMessages() {
+    const cutoff = getMentionLoadCutoff();
     const foundMessages: LoadedRecentMentionMessage[] = [];
     let before: string | undefined;
 
@@ -2641,6 +2666,7 @@ async function fetchRecentMentionMessages() {
 
         for (const rawMessage of batch) {
             const channelId = rawMessage.channel_id ?? rawMessage.channelId;
+            if (isMessageTooOld(rawMessage, cutoff)) continue;
             if (!isUnreadMentionMessage(rawMessage, channelId)) continue;
             if (dismissedNoticeIds.has(rawMessage.id)) continue;
             if (shouldAutoReadBotMention(rawMessage)) {
@@ -2662,7 +2688,7 @@ async function fetchRecentMentionMessages() {
         }
 
         const oldestFetched = batch.at(-1);
-        if (!oldestFetched || batch.length < RECENT_MENTIONS_PAGE_LIMIT) break;
+        if (!oldestFetched || batch.length < RECENT_MENTIONS_PAGE_LIMIT || isMessageTooOld(oldestFetched, cutoff)) break;
         before = oldestFetched.id;
     }
 
@@ -2679,8 +2705,10 @@ async function fetchKeywordNotifierMentionMessages() {
         keywordMessages.map(message => message.id ?? message.message_id ?? message.messageId).filter(Boolean)
     );
 
+    const cutoff = getMentionLoadCutoff();
     for (const rawMessage of keywordMessages) {
         const channelId = rawMessage.channel_id ?? rawMessage.channelId;
+        if (isMessageTooOld(rawMessage, cutoff)) continue;
         if (!channelId || !isUnreadMentionMessage(rawMessage, channelId)) continue;
         if (dismissedNoticeIds.has(rawMessage.id)) continue;
         if (shouldAutoReadBotMention(rawMessage)) {
@@ -4380,15 +4408,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         event.preventDefault();
         event.stopPropagation();
 
-        UserProfileActions.openUserProfileModal({
-            userId: notice.authorId,
-            guildId: notice.guildId ?? undefined,
-            channelId: notice.channelId,
-            analyticsLocation: {
-                page: notice.guildId ? "Guild Channel" : "DM Channel",
-                section: "MentionsBox"
-            }
-        });
+        void openProfile(notice.authorId, notice);
     }, [notice]);
 
     const markCurrentNoticeRead = useCallback((focusNextReplyInput = false) => {
@@ -4700,12 +4720,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         if (!userId) return;
         event.preventDefault();
         event.stopPropagation();
-        UserProfileActions.openUserProfileModal({
-            userId,
-            guildId: notice.guildId ?? undefined,
-            channelId: notice.channelId,
-            analyticsLocation: { page: notice.guildId ? "Guild Channel" : "DM Channel", section: "MentionsBox" }
-        });
+        void openProfile(userId, notice);
     }, [notice.channelId, notice.guildId]);
 
     const insertAutocompletedEmoji = useCallback((emoji: Emoji) => {
