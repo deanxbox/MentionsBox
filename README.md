@@ -63,6 +63,8 @@ Each notification shows up to five of your most-used reaction emojis, matching D
 
 Each notification includes a compact reply bar for sending a reply to the mentioned message without leaving the current channel. Replies mention the original author. If `jumpOnReply` is enabled, MentionsBox jumps to the mentioned message after the reply sends.
 
+Using `{message.content}` also adds image and GIF attachment URLs and image URLs from embeds in the mentioned message, allowing Discord to generate their embeds. Video and other non-image attachments are not copied. Remove an image chip to omit that image from the reply.
+
 ## Reply Chains
 
 When a mentioned message is part of a reply chain, MentionsBox walks the linked replies until there are no more referenced messages and stores a compact preview of the full available chain. If new replies arrive while the notification is still queued, replies linked anywhere in that chain are stored too. Use the Show replies toggle on the notification to expand or collapse this context; expanded messages include author avatars.

@@ -56,7 +56,9 @@ import {
 import { filterAndSortNotices, getNextNoticeId, type MentionFilter } from "./manager";
 import { getPlaceholderAutocompleteOptionId, PLACEHOLDER_AUTOCOMPLETE_ID, PlaceholderAutocomplete, type ReplyAutocompletePosition } from "./PlaceholderAutocomplete";
 import {
+    appendReplyImageUrls,
     getNativeFavoriteStickerIds,
+    getReplyImageUrls,
     getReplyPlaceholderMatch,
     getReplyPlaceholderSuggestions,
     getReplyStickerId,
@@ -4176,6 +4178,8 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     const [hoveredEmoji, setHoveredEmoji] = useState<Emoji | null>(null);
     const [selectedSticker, setSelectedSticker] = useState<SelectedReplySticker>(() => getRestoredNoticeSticker(notice));
     const [replyFiles, setReplyFiles] = useState<ReplyFile[]>(() => restoredReplyEntries.get(notice.id)?.files ?? []);
+    const [removedReplyImageUrls, setRemovedReplyImageUrls] = useState<string[]>([]);
+    const [copiedReplyImageUrls, setCopiedReplyImageUrls] = useState<string[]>([]);
     const [isCopyingVoice, setIsCopyingVoice] = useState(false);
     const [contentOverflows, setContentOverflows] = useState(false);
     const [interactionNavIndex, setInteractionNavIndex] = useState<number | null>(null);
@@ -4212,8 +4216,10 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         .map(dialogue => ({
             ...dialogue,
             copiesSticker: Boolean(notice.originalSticker && usesMessageContentPlaceholder(dialogue.content)),
+            copiesImages: getReplyImageUrls(dialogue.content, notice.media).length > 0,
             content: resolveInteractionReply(dialogue.content, notice)
         }));
+    const replyImageUrls = [...new Set([...getReplyImageUrls(replyContent, notice.media), ...copiedReplyImageUrls])].filter(url => !removedReplyImageUrls.includes(url));
     const filteredInteractionReplies = useMemo(() => {
         const query = interactionSearch.trim().toLowerCase();
         if (!query) return interactionReplies;
@@ -4572,7 +4578,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         event.preventDefault();
         event.stopPropagation();
 
-        const content = resolveInteractionReply(replyContent.trim(), notice).trim();
+        const content = appendReplyImageUrls(resolveInteractionReply(replyContent.trim(), notice).trim(), replyImageUrls);
         const stickerId = getReplyStickerId(replyContent, selectedSticker?.id, notice.originalSticker?.id);
         const stickerIds = stickerId ? [stickerId] : [];
         const shouldJumpOnReply = forceJumpOnSubmitRef.current || settings.store.jumpOnReply;
@@ -4580,7 +4586,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         if (!content && stickerIds.length === 0 && replyFiles.length === 0) return;
 
         dispatchReply(content, stickerIds, replyFiles, shouldJumpOnReply, "Reply failed in the background; mention restored.");
-    }, [dispatchReply, notice, replyContent, replyFiles, selectedSticker]);
+    }, [dispatchReply, notice, replyContent, replyFiles, replyImageUrls, selectedSticker]);
 
     const reactToMention = useCallback((event: React.MouseEvent, emoji: Emoji, isReacted: boolean) => {
         event.preventDefault();
@@ -4641,20 +4647,23 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         setIsInteractionExpanded(prev => !prev);
     }, []);
 
-    const useInteractionReply = useCallback((event: React.MouseEvent, content: string, copiesSticker: boolean) => {
+    const useInteractionReply = useCallback((event: React.MouseEvent, content: string, copiesSticker: boolean, copiesImages: boolean) => {
         event.preventDefault();
         event.stopPropagation();
 
         if (dialogueButtonMode === DialogueButtonMode.Send) {
-            if (!content.trim() && !copiesSticker) return;
+            const imageUrls = copiesImages ? getReplyImageUrls("{message.content}", notice.media) : [];
+            if (!content.trim() && !copiesSticker && !imageUrls.length) return;
 
             const shouldJumpOnReply = settings.store.jumpOnReply;
-            dispatchReply(content.trim(), copiesSticker && notice.originalSticker ? [notice.originalSticker.id] : [], [], shouldJumpOnReply, "Interaction reply failed in the background; mention restored.");
+            dispatchReply(appendReplyImageUrls(content.trim(), imageUrls), copiesSticker && notice.originalSticker ? [notice.originalSticker.id] : [], [], shouldJumpOnReply, "Interaction reply failed in the background; mention restored.");
             return;
         }
 
         const input = replyInputRef.current;
         if (!input || !insertReplyContent(input, 0, replyContent.length, content)) return;
+        setCopiedReplyImageUrls(copiesImages ? getReplyImageUrls("{message.content}", notice.media) : []);
+        setRemovedReplyImageUrls([]);
         updateReplyFromEditor(input);
         setSelectedSticker(copiesSticker ? notice.originalSticker ?? null : null);
         requestAnimationFrame(() => replyInputRef.current?.focus());
@@ -4716,9 +4725,13 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         const input = replyInputRef.current;
         if (!input || !insertReplyContent(input, placeholderMatch.startIndex, placeholderMatch.endIndex + trailingBrace, replacement)) return;
         updateReplyFromEditor(input);
-        if (placeholder.key === "message.content" && notice.originalSticker) setSelectedSticker(notice.originalSticker);
+        if (placeholder.key === "message.content") {
+            setCopiedReplyImageUrls(getReplyImageUrls(placeholder.token, notice.media));
+            setRemovedReplyImageUrls([]);
+            if (notice.originalSticker) setSelectedSticker(notice.originalSticker);
+        }
         requestAnimationFrame(() => replyInputRef.current?.focus());
-    }, [replyContent, placeholderMatch, notice.originalSticker, updateReplyFromEditor]);
+    }, [replyContent, placeholderMatch, notice, updateReplyFromEditor]);
 
     const appendEmojiToReply = useCallback((emoji: Emoji) => {
         const input = replyInputRef.current;
@@ -5263,7 +5276,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
                                             key={reply.id}
                                             className="vc-mentions-box-dialogue-button"
                                             type="button"
-                                            onClick={event => useInteractionReply(event, reply.content, reply.copiesSticker)}
+                                            onClick={event => useInteractionReply(event, reply.content, reply.copiesSticker, reply.copiesImages)}
                                             onContextMenu={event => deleteInteractionReply(event, reply.id)}
                                             title={`${reply.content}
 Right-click to delete this response`}
@@ -5311,6 +5324,16 @@ Right-click to delete this response`}
                             ))}
                         </div>
                     )}
+                    {replyImageUrls.map(url => (
+                        <div className="vc-mentions-box-reply-image-chip" key={url}>
+                            <img src={url} alt="" />
+                            <span>Image</span>
+                            <button type="button" onClick={() => {
+                                setRemovedReplyImageUrls(current => [...current, url]);
+                                setCopiedReplyImageUrls(current => current.filter(item => item !== url));
+                            }} aria-label="Remove copied image">×</button>
+                        </div>
+                    ))}
                     {selectedSticker && (
                         <div className="vc-mentions-box-selected-sticker" onClick={event => event.stopPropagation()}>
                             <PreviewImage

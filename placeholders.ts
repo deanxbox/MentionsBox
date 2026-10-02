@@ -110,6 +110,19 @@ export function usesMessageContentPlaceholder(content: string) {
     return content.includes("{message.content}");
 }
 
+export function getReplyImageUrls(content: string, media: Array<{ kind: string; url: string }>) {
+    if (!usesMessageContentPlaceholder(content)) return [];
+    const source = content.replace(/\{message\.content\}/g, "");
+    return [...new Set(media
+        .filter(item => item.kind === "image" || item.kind === "gif")
+        .map(item => item.url)
+        .filter(url => url && !source.includes(url)))];
+}
+
+export function appendReplyImageUrls(content: string, urls: string[]) {
+    return [...new Set(urls)].reduce((result, url) => result.includes(url) ? result : `${result}${result ? " " : ""}${url}`, content);
+}
+
 export function getReplyStickerId(content: string, selectedStickerId?: string | null, originalStickerId?: string | null) {
     return usesMessageContentPlaceholder(content) && originalStickerId ? originalStickerId : selectedStickerId;
 }

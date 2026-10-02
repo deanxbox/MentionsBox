@@ -30,7 +30,7 @@ const common = `
     export const useStateFromStores = (_stores, callback) => callback();
     export const UserProfileActions = { openUserProfileModal: () => { window.profileOpened = true; } };
     export const ChannelStore = { getChannel: () => null }, GuildStore = {}, MessageStore = {}, ReadStateStore = {}, UserSettingsProtoStore = {};
-    export const FluxDispatcher = {}, Forms = {}, Menu = {}, Modal = {}, NavigationRouter = {}, Constants = { GLOBAL_ENV: { MEDIA_PROXY_ENDPOINT: 'https://media.discordapp.net', CDN_HOST: 'cdn.discordapp.com' } }, RestAPI = {};
+    export const FluxDispatcher = { dispatch: () => {} }, Forms = {}, Menu = {}, Modal = {}, NavigationRouter = {}, Constants = { GLOBAL_ENV: { MEDIA_PROXY_ENDPOINT: 'https://media.discordapp.net', CDN_HOST: 'cdn.discordapp.com' }, Endpoints: { MESSAGES: id => '/channels/' + id + '/messages' } }, RestAPI = { post: options => { window.sentBodies.push(options.body); return Promise.resolve({ body: { id: 'sent' } }); } };
     export const PermissionsBits = {}, PermissionStore = {}, Select = () => null;
     export const openMediaModal = () => {}, openModal = () => {};
 `;
@@ -71,7 +71,8 @@ async function bundle() {
         stdin: { contents: `import React from 'react'; import { createRoot } from 'react-dom/client';
             import { MentionCard, serializeReplyContent, setReplySelectionOffsets } from './index.tsx';
             window.GLOBAL_ENV = { MEDIA_PROXY_ENDPOINT: 'https://media.discordapp.net' };
-            const notice = { id: 'notice', kind: 'mention', channelId: 'channel', guildId: null, channelName: 'test', authorId: '123', authorName: 'Mason Plebanek', authorUsername: 'Mason Plebanek', authorDisplayName: 'Mason Plebanek', content: '<@123> test 😭', messageText: '<@123> test 😭', timestamp: Date.now(), media: [], originalSticker: { id: '789', name: 'Wave', formatType: 1 } };
+            window.sentBodies = [];
+            const notice = { id: 'notice', kind: 'mention', channelId: 'channel', guildId: null, channelName: 'test', authorId: '123', authorName: 'Mason Plebanek', authorUsername: 'Mason Plebanek', authorDisplayName: 'Mason Plebanek', content: '<@123> test 😭', messageText: '<@123> test 😭', timestamp: Date.now(), media: [{ id: 'image', kind: 'image', url: ${JSON.stringify(emojiUrl)}, label: 'Image' }], replyChain: [{ id: 'reply', authorName: 'Mason Plebanek', content: 'Reply chain 😭', media: [] }], originalSticker: { id: '789', name: 'Wave', formatType: 1 } };
             const root = createRoot(document.getElementById('mount'));
             let key = 0;
             window.mountCard = () => root.render(React.createElement(MentionCard, { key: ++key, notice }));
@@ -203,19 +204,33 @@ async function frames(page) {
         await frames(page);
         await page.getByRole("button", { name: "View interaction", exact: true }).click();
         await page.getByRole("button", { name: "Copy message", exact: true }).click();
+        await page.getByRole("button", { name: "View reply chain", exact: true }).click();
         await frames(page);
         await page.evaluate(() => document.activeElement.blur());
         const screenshot = path.join(os.tmpdir(), `mentionsbox-${before ? "before" : "after"}.png`);
         await page.screenshot({ path: screenshot });
         console.log(`Screenshot: ${screenshot}`);
+        if (!before) {
+            await page.getByRole("button", { name: "Reply", exact: true }).click();
+            await page.waitForFunction(() => window.sentBodies.length === 1, null, { timeout: 3000 });
+            const copiedContent = await page.evaluate(() => window.sentBodies[0].content);
+            assert.ok(copiedContent.includes(emojiUrl), "message-content button draft sends the image URL");
+            await page.getByRole("button", { name: "Remove copied image", exact: true }).click();
+            assert.equal(await page.locator(".vc-mentions-box-reply-image-chip").count(), 0, "removed image chip disappears");
+            await page.getByRole("button", { name: "Reply", exact: true }).click();
+            await page.waitForFunction(() => window.sentBodies.length === 2, null, { timeout: 3000 });
+            assert.equal(await page.evaluate(url => window.sentBodies[1].content.includes(url), emojiUrl), false, "removed image is omitted from outgoing content");
+        }
+        assert.equal(await page.locator(".vc-mentions-box-reply-image-chip").count(), 0, "removing an image chip omits its URL");
         const measurements = await page.evaluate(() => {
-            const measure = selector => {
+            const measure = (selector, textNeedle) => {
                 const el = document.querySelector(selector);
                 const mention = el.querySelector('[data-raw^="<@"], .mention');
                 const emoji = el.querySelector('img.emoji, .vc-mentions-box-reply-token-emoji');
-                const text = Array.from(el.childNodes).find(node => node.nodeType === Node.TEXT_NODE && node.textContent.includes('test'));
+                const text = [el, ...el.querySelectorAll('*')].flatMap(node => Array.from(node.childNodes)).find(node => node.nodeType === Node.TEXT_NODE && node.textContent.includes(textNeedle));
                 const textRange = document.createRange(); textRange.selectNodeContents(text);
-                const pillRange = document.createRange(); pillRange.selectNodeContents(mention.lastChild);
+                const pillRange = document.createRange();
+                if (mention) pillRange.selectNodeContents(mention.lastChild);
                 const centre = rect => rect.top + rect.height / 2;
                 const avatar = el.querySelector('.vc-mentionAvatars-icon');
                 const css = getComputedStyle(el);
@@ -228,16 +243,36 @@ async function frames(page) {
                 clone.querySelectorAll('img.emoji, .vc-mentions-box-reply-token-emoji').forEach(img => img.replaceWith(document.createTextNode('x')));
                 const plainLineBox = clone.getBoundingClientRect().height;
                 clone.remove();
-                return { text: centre(textRange.getBoundingClientRect()), pill: centre(pillRange.getBoundingClientRect()), emoji: centre(emoji.getBoundingClientRect()), lineHeight: css.lineHeight, lineBox, plainLineBox, avatarHeight: avatar?.getBoundingClientRect().height, tokenDisplay: getComputedStyle(mention).display, tokenRaw: mention.dataset.raw };
+                const emojiStyle = getComputedStyle(emoji);
+                return { text: centre(textRange.getBoundingClientRect()), pill: mention ? centre(pillRange.getBoundingClientRect()) : null, emoji: centre(emoji.getBoundingClientRect()), emojiWidth: emoji.getBoundingClientRect().width, emojiHeight: emoji.getBoundingClientRect().height, emojiFontSize: parseFloat(emojiStyle.fontSize), lineHeight: css.lineHeight, lineBox, plainLineBox, avatarHeight: avatar?.getBoundingClientRect().height, tokenDisplay: mention ? getComputedStyle(mention).display : null, tokenRaw: mention?.dataset.raw };
             };
-            return { notice: measure('.vc-mentions-box-content'), editor: measure('.vc-mentions-box-reply-input') };
+            const reference = document.createElement('div');
+            reference.className = 'vc-mentions-box-content';
+            reference.style.cssText = 'position:absolute;visibility:hidden;font-size:16px;line-height:20px';
+            reference.innerHTML = 'reference <img class="emoji" src="' + document.querySelector('.vc-mentions-box-content img.emoji').src + '">';
+            document.body.appendChild(reference);
+            const image = reference.querySelector('img');
+            const referenceSize = { width: image.getBoundingClientRect().width, height: image.getBoundingClientRect().height, fontSize: parseFloat(getComputedStyle(image).fontSize) };
+            reference.remove();
+            return {
+                notice: measure('.vc-mentions-box-content', 'test'),
+                chain: measure('.vc-mentions-box-thread-content', 'Reply chain'),
+                editor: measure('.vc-mentions-box-reply-input', 'test'),
+                referenceSize
+            };
         });
         console.log("Measurements:", JSON.stringify(measurements));
-        if (!before) for (const [name, rects] of Object.entries(measurements)) {
-            assert.ok(Math.abs(rects.text - rects.pill) <= 1, `${name}: pill baseline ${JSON.stringify(rects)}`);
-            assert.ok(Math.abs(rects.text - rects.emoji) <= 1, `${name}: emoji baseline ${JSON.stringify(rects)}`);
-            assert.equal(rects.tokenDisplay, "inline");
+        if (!before) for (const [name, rects] of Object.entries(measurements).filter(([name]) => name !== "referenceSize")) {
+            if (rects.pill !== null) assert.ok(Math.abs(rects.text - rects.pill) <= 1, `${name}: pill baseline ${JSON.stringify(rects)}`);
+            assert.ok(Math.abs(rects.text - rects.emoji) <= 1.5, `${name}: emoji baseline ${JSON.stringify(rects)}`);
+            assert.ok(Math.abs(rects.emojiWidth - rects.emojiFontSize * 1.375) <= 0.1, `${name}: emoji width is 1.375em ${JSON.stringify(rects)}`);
+            assert.ok(Math.abs(rects.emojiHeight - rects.emojiFontSize * 1.375) <= 0.1, `${name}: emoji height is 1.375em ${JSON.stringify(rects)}`);
+            if (rects.tokenDisplay !== null) assert.equal(rects.tokenDisplay, "inline");
             assert.equal(rects.lineBox, rects.plainLineBox, `${name}: emoji must not grow the line box`);
+        }
+        if (!before) {
+            assert.ok(Math.abs(measurements.referenceSize.width - 22) <= 0.1, "16px inline emoji width is 22px");
+            assert.ok(Math.abs(measurements.referenceSize.height - 22) <= 0.1, "16px inline emoji height is 22px");
         }
         if (!before) {
             assert.equal(measurements.notice.avatarHeight, 13, "notice rule must not override MentionAvatars sizing");

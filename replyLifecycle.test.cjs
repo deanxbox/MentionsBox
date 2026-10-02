@@ -118,20 +118,23 @@ function testAutocompleteTokenAndValuePathsSelectTheOriginalSticker() {
     for (const mode of ["token", "value"]) {
         const calls = { insert: [], update: [], selected: [] };
         const input = { focus() {} };
-        const action = new Function("placeholderMatch", "replyContent", "replyInputRef", "insertReplyContent", "updateReplyFromEditor", "setSelectedSticker", "notice", "requestAnimationFrame", `return ${callback};`)(
+        const imageState = [];
+        const action = new Function("placeholderMatch", "replyContent", "replyInputRef", "insertReplyContent", "updateReplyFromEditor", "setSelectedSticker", "notice", "requestAnimationFrame", "getReplyImageUrls", "setCopiedReplyImageUrls", "setRemovedReplyImageUrls", `return ${callback};`)(
             { startIndex: 0, endIndex: 4 }, "{mes", { current: input }, (...args) => { calls.insert.push(args); return true; },
             value => calls.update.push(value), value => calls.selected.push(value),
-            { originalSticker: { id: "original", name: "Sticker" } }, fn => fn()
+            { originalSticker: { id: "original", name: "Sticker" }, media: [{ kind: "image", url: "https://cdn.test/a.png" }] }, fn => fn(),
+            (_token, media) => media.map(item => item.url), value => imageState.push(value), value => imageState.push(value)
         );
         action({ key: "message.content", token: "{message.content}", resolvedValue: "the original text" }, mode);
         assert.deepEqual(calls.insert[0].slice(0, 3), [input, 0, 4]);
         assert.equal(calls.insert[0][3], mode === "token" ? "{message.content}" : "the original text");
         assert.equal(calls.selected[0].id, "original");
         assert.equal(calls.update[0], input);
+        assert.deepEqual(imageState, [["https://cdn.test/a.png"], []], "explicit placeholder insertion previews original image attachments");
     }
     const untouched = [];
-    const noStickerAction = new Function("placeholderMatch", "replyContent", "replyInputRef", "insertReplyContent", "updateReplyFromEditor", "setSelectedSticker", "notice", "requestAnimationFrame", `return ${callback};`)(
-        { startIndex: 0, endIndex: 4 }, "{mes", { current: { focus() {} } }, () => true, () => {}, value => untouched.push(value), {}, () => {}
+    const noStickerAction = new Function("placeholderMatch", "replyContent", "replyInputRef", "insertReplyContent", "updateReplyFromEditor", "setSelectedSticker", "notice", "requestAnimationFrame", "getReplyImageUrls", "setCopiedReplyImageUrls", "setRemovedReplyImageUrls", `return ${callback};`)(
+        { startIndex: 0, endIndex: 4 }, "{mes", { current: { focus() {} } }, () => true, () => {}, value => untouched.push(value), {}, () => {}, () => [], () => {}, () => {}
     );
     noStickerAction({ key: "message.content", token: "{message.content}", resolvedValue: "text" }, "token");
     assert.deepEqual(untouched, [], "autocomplete leaves any manually selected sticker unchanged when notice has none");
@@ -140,18 +143,18 @@ function testAutocompleteTokenAndValuePathsSelectTheOriginalSticker() {
 function testDialogueSendAndDraftUseOriginalStickerExplicitly() {
     const callback = getCallback("useInteractionReply");
     const sent = [];
-    const send = new Function("dialogueButtonMode", "dispatchReply", "notice", "settings", "replyInputRef", "replyContent", "insertReplyContent", "updateReplyFromEditor", "setSelectedSticker", "requestAnimationFrame", `const DialogueButtonMode = { Send: "send", Draft: "draft" }; return ${callback};`)(
-        "send", (...args) => sent.push(args), { originalSticker: { id: "original", name: "Sticker" } },
-        { store: { jumpOnReply: false } }, { current: null }, "", () => true, () => {}, () => {}, () => {}
+    const send = new Function("dialogueButtonMode", "dispatchReply", "notice", "settings", "replyInputRef", "replyContent", "insertReplyContent", "updateReplyFromEditor", "setSelectedSticker", "requestAnimationFrame", "getReplyImageUrls", "appendReplyImageUrls", "setCopiedReplyImageUrls", "setRemovedReplyImageUrls", `const DialogueButtonMode = { Send: "send", Draft: "draft" }; return ${callback};`)(
+        "send", (...args) => sent.push(args), { originalSticker: { id: "original", name: "Sticker" }, media: [] },
+        { store: { jumpOnReply: false } }, { current: null }, "", () => true, () => {}, () => {}, () => {}, () => [], (content, urls) => urls.length ? `${content} ${urls.join(" ")}` : content, () => {}, () => {}
     );
     send({ preventDefault() {}, stopPropagation() {} }, "resolved message", true);
     assert.deepEqual(sent[0].slice(0, 3), ["resolved message", ["original"], []]);
 
     const draft = [];
     const insertCalls = [];
-    const useDraft = new Function("dialogueButtonMode", "dispatchReply", "notice", "settings", "replyInputRef", "replyContent", "insertReplyContent", "updateReplyFromEditor", "setSelectedSticker", "requestAnimationFrame", `const DialogueButtonMode = { Send: "send", Draft: "draft" }; return ${callback};`)(
-        "draft", () => {}, { originalSticker: { id: "original", name: "Sticker" } }, { store: {} },
-        { current: { focus() {} } }, "draft", (...args) => { insertCalls.push(args); return true; }, () => {}, value => draft.push(value), fn => fn()
+    const useDraft = new Function("dialogueButtonMode", "dispatchReply", "notice", "settings", "replyInputRef", "replyContent", "insertReplyContent", "updateReplyFromEditor", "setSelectedSticker", "requestAnimationFrame", "getReplyImageUrls", "appendReplyImageUrls", "setCopiedReplyImageUrls", "setRemovedReplyImageUrls", `const DialogueButtonMode = { Send: "send", Draft: "draft" }; return ${callback};`)(
+        "draft", () => {}, { originalSticker: { id: "original", name: "Sticker" }, media: [] }, { store: {} },
+        { current: { focus() {} } }, "draft", (...args) => { insertCalls.push(args); return true; }, () => {}, value => draft.push(value), fn => fn(), () => [], (content, urls) => urls.length ? `${content} ${urls.join(" ")}` : content, () => {}, () => {}
     );
     useDraft({ preventDefault() {}, stopPropagation() {} }, "resolved message", true);
     assert.deepEqual(insertCalls[0].slice(1), [0, 5, "resolved message"]);
