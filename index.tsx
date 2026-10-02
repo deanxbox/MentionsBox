@@ -756,6 +756,8 @@ let pluginStarted = false;
 let notices: MentionNotice[] = [];
 const discardedNoticeHistory: NoticeUndoEntry[] = [];
 const restoredReplyEntries = new Map<string, NoticeUndoEntry>();
+// Unsent reply text/media per notice: survives hiding the box and is attached to the Ctrl+Z entry if the notice is discarded.
+const replyDrafts = new Map<string, Pick<NoticeUndoEntry, "replyContent" | "stickerIds" | "files">>();
 let pruneInterval: ReturnType<typeof setInterval> | null = null;
 let unreadLoadTimeout: ReturnType<typeof setTimeout> | null = null;
 let isLoadingUnreadMentions = false;
@@ -844,7 +846,9 @@ function setNotices(nextNotices: MentionNotice[], recordUndo = true) {
         if (!nextIds.has(notice.id)) {
             const restored = restoredReplyEntries.get(notice.id);
             if (restored) restoredReplyEntries.delete(notice.id);
-            const entry = restored ? { ...restored, notice } : { notice };
+            const draft = replyDrafts.get(notice.id);
+            replyDrafts.delete(notice.id);
+            const entry = { ...restored, ...draft, notice };
             if (recordUndo) {
                 pushReplyHistory(discardedNoticeHistory, entry);
                 removedEntries.push(entry);
@@ -1497,7 +1501,7 @@ function getStickerName(sticker: any) {
 }
 
 function getRestoredNoticeSticker(notice: MentionNotice): SelectedReplySticker {
-    const id = restoredReplyEntries.get(notice.id)?.stickerIds?.[0];
+    const id = (restoredReplyEntries.get(notice.id) ?? replyDrafts.get(notice.id))?.stickerIds?.[0];
     if (!id) return null;
     if (notice.originalSticker?.id === id) return notice.originalSticker;
     const sticker = StickersStore.getStickerById(id);
@@ -4189,7 +4193,7 @@ function getPickerPosition(button: HTMLButtonElement) {
 }
 
 function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?: (id: string, focusReplyInput?: boolean, focusAfterJump?: boolean) => void; }) {
-    const [replyContent, setReplyContent] = useState(() => restoredReplyEntries.get(notice.id)?.replyContent ?? "");
+    const [replyContent, setReplyContent] = useState(() => (restoredReplyEntries.get(notice.id) ?? replyDrafts.get(notice.id))?.replyContent ?? "");
     const [isExpanded, setIsExpanded] = useState(() => settings.store.autoExpandReadMore);
     const [isReplyExpanded, setIsReplyExpanded] = useState(() => settings.store.autoViewReplyChain);
     const [isInteractionExpanded, setIsInteractionExpanded] = useState(false);
@@ -4205,7 +4209,12 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     const [emojiSearch, setEmojiSearch] = useState("");
     const [hoveredEmoji, setHoveredEmoji] = useState<Emoji | null>(null);
     const [selectedSticker, setSelectedSticker] = useState<SelectedReplySticker>(() => getRestoredNoticeSticker(notice));
-    const [replyFiles, setReplyFiles] = useState<ReplyFile[]>(() => restoredReplyEntries.get(notice.id)?.files ?? []);
+    const [replyFiles, setReplyFiles] = useState<ReplyFile[]>(() => (restoredReplyEntries.get(notice.id) ?? replyDrafts.get(notice.id))?.files ?? []);
+
+    useEffect(() => {
+        if (!replyContent.trim() && !replyFiles.length && !selectedSticker) replyDrafts.delete(notice.id);
+        else replyDrafts.set(notice.id, { replyContent, files: replyFiles, stickerIds: selectedSticker ? [selectedSticker.id] : undefined });
+    }, [notice.id, replyContent, replyFiles, selectedSticker]);
     const [removedReplyImageUrls, setRemovedReplyImageUrls] = useState<string[]>([]);
     const [copiedReplyImageUrls, setCopiedReplyImageUrls] = useState<string[]>([]);
     const [isCopyingVoice, setIsCopyingVoice] = useState(false);
@@ -5925,6 +5934,7 @@ export default definePlugin({
         setNotices([], false);
         discardedNoticeHistory.length = 0;
         restoredReplyEntries.clear();
+        replyDrafts.clear();
         removeServerListElement(ServerListRenderPosition.Above, renderMentionsSectionButton);
         unmountRoot();
     },
