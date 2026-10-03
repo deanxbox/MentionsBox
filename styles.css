@@ -588,6 +588,7 @@
 }
 
 .vc-mentions-box-avatar-button {
+    position: relative;
     display: grid;
     width: 36px;
     height: 36px;
@@ -612,6 +613,21 @@
     border-radius: 50%;
     justify-self: center;
     object-fit: cover;
+}
+
+.vc-mentions-box-status-dot {
+    position: absolute;
+    right: -2px;
+    bottom: -2px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    box-shadow: 0 0 0 2px var(--background-base-low, var(--background-primary));
+}
+
+.vc-mentions-box-device {
+    margin-left: 4px;
+    vertical-align: middle;
 }
 
 .vc-mentions-box-avatar-fallback {
