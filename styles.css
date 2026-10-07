@@ -2643,3 +2643,88 @@
         grid-template-columns: 1fr;
     }
 }
+
+/* ---- UI revamp overrides ---- */
+.vc-mentions-box-card {
+    background: linear-gradient(135deg, color-mix(in oklab, var(--background-secondary, #2b2d31) 92%, var(--brand-500)) 0%, var(--background-secondary, #2b2d31) 60%);
+    border-color: color-mix(in oklab, var(--background-modifier-accent) 70%, transparent);
+    border-radius: 12px;
+    box-shadow: 0 6px 20px rgb(0 0 0 / 28%), inset 0 1px 0 rgb(255 255 255 / 4%);
+    transition: border-color 150ms ease, transform 150ms ease, box-shadow 150ms ease;
+}
+
+.vc-mentions-box-card:hover,
+.vc-mentions-box-card:focus-within {
+    background: linear-gradient(135deg, color-mix(in oklab, var(--background-secondary, #2b2d31) 86%, var(--brand-500)) 0%, var(--background-secondary, #2b2d31) 65%);
+    box-shadow: 0 10px 28px rgb(0 0 0 / 38%), 0 0 0 1px color-mix(in oklab, var(--brand-500) 55%, transparent);
+    transform: translateY(-2px);
+}
+
+.vc-mentions-box-accent {
+    border-radius: 0 4px 4px 0;
+}
+
+.vc-mentions-box-body {
+    padding: 10px 12px 10px 0;
+}
+
+.vc-mentions-box-avatar {
+    box-shadow: 0 0 0 2px color-mix(in oklab, var(--brand-500) 40%, transparent);
+}
+
+.vc-mentions-box-author {
+    font-size: 15px;
+}
+
+.vc-mentions-box-guild,
+.vc-mentions-box-channel {
+    padding: 1px 7px;
+    background: var(--background-modifier-hover);
+    border-radius: 999px;
+}
+
+.vc-mentions-box-guild::after,
+.vc-mentions-box-channel::after {
+    content: none;
+}
+
+.vc-mentions-box-content {
+    font-size: 14px;
+    line-height: 19px;
+}
+
+.vc-mentions-box-expire-bar {
+    height: 2px;
+    background: linear-gradient(90deg, var(--brand-500), color-mix(in oklab, var(--brand-500) 40%, white));
+    transition: none;
+}
+
+.vc-mentions-box-manager {
+    border-radius: 0 0 12px 12px;
+}
+
+.vc-mentions-box-manager-search-wrap,
+.vc-mentions-box-manager-select,
+.vc-mentions-box-manager-button {
+    border-radius: 8px;
+}
+
+.vc-mentions-box-empty {
+    padding: 56px 16px;
+    background: transparent;
+    border: 1px dashed var(--background-modifier-accent);
+    border-radius: 12px;
+}
+
+.vc-mentions-box-source-filter-summary,
+.vc-mentions-box-source-filter-menu,
+.vc-mentions-box-keybind-toast {
+    border-radius: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .vc-mentions-box-card,
+    .vc-mentions-box-manager-button { transition: none; }
+    .vc-mentions-box-card:hover,
+    .vc-mentions-box-card:focus-within { transform: none; }
+}

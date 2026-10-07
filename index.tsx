@@ -4175,49 +4175,43 @@ function ReplyAutocompleteLayer({
 }
 
 function ExternalReactionExpiry({ noticeId, durationMs, paused }: { noticeId: string; durationMs: number; paused: boolean; }) {
-    const [progress, setProgress] = useState(0);
+    const barRef = useRef<HTMLDivElement>(null);
 
+    // Drive the bar via the DOM directly: no React re-render on every animation frame.
     useEffect(() => {
+        const bar = barRef.current;
         let animationFrame = 0;
         let currentProgress = 0;
         let lastTick = performance.now();
+
+        const setBar = (value: number) => { if (bar) bar.style.transform = "scaleX(" + value + ")"; };
 
         const tick = (now: number) => {
             if (paused) {
                 if (currentProgress !== 0) {
                     currentProgress = 0;
-                    setProgress(0);
+                    setBar(0);
                 }
+            } else {
+                currentProgress = Math.min(1, currentProgress + (now - lastTick) / durationMs);
+                setBar(currentProgress);
 
-                lastTick = now;
-                animationFrame = requestAnimationFrame(tick);
-                return;
+                if (currentProgress >= 1) {
+                    removeNotice(noticeId);
+                    return;
+                }
             }
 
-            currentProgress = Math.min(1, currentProgress + (now - lastTick) / durationMs);
             lastTick = now;
-            setProgress(currentProgress);
-
-            if (currentProgress >= 1) {
-                removeNotice(noticeId);
-                return;
-            }
-
             animationFrame = requestAnimationFrame(tick);
         };
 
-        setProgress(0);
+        setBar(0);
         animationFrame = requestAnimationFrame(tick);
         return () => cancelAnimationFrame(animationFrame);
     }, [durationMs, noticeId, paused]);
 
-    return (
-        <div
-            className="vc-mentions-box-expire-bar"
-            style={{ transform: `scaleX(${progress})` }}
-            aria-hidden
-        />
-    );
+    return <div ref={barRef} className="vc-mentions-box-expire-bar" aria-hidden />;
 }
 
 function getPickerPosition(button: HTMLButtonElement) {
