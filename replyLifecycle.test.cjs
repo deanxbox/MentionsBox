@@ -34,6 +34,7 @@ function createNoticeState(initialNotices, recorded) {
         let notices = initialNotices;
         const discardedNoticeHistory = recorded;
         const restoredReplyEntries = new Map();
+        const replyDrafts = new Map();
         const dismissedNoticeIds = new Set();
         const pendingReplyNoticeRemovalIds = new Set();
         const emitChange = () => {};
@@ -76,7 +77,7 @@ function testHistoryCapacityAndUnsentRestoration() {
 
 function testOpeningStickerNoticeDoesNotSelectItsSticker() {
     const code = getFunction("getRestoredNoticeSticker");
-    const getRestoredNoticeSticker = new Function("restoredReplyEntries", "StickersStore", `${code}; return getRestoredNoticeSticker;`)(new Map(), { getStickerById: () => undefined });
+    const getRestoredNoticeSticker = new Function("restoredReplyEntries", "replyDrafts", "StickersStore", `${code}; return getRestoredNoticeSticker;`)(new Map(), new Map(), { getStickerById: () => undefined });
     assert.equal(getRestoredNoticeSticker({ id: "notice", originalSticker: { id: "original-id", name: "sticker" } }), null);
 }
 
@@ -284,9 +285,9 @@ async function testOriginalStickerUsesSharedSendAndOptionalCloneFallback() {
         return { sendContent: content, stickerIds };
     };
     const sendReplyToNotice = async(_notice, content, stickerIds) => { sent.push({ content, stickerIds }); return "sent"; };
-    const send = new Function("settings", "uploadReplyAttachment", "prepareCloneFallback", "sendReplyToNotice", "deleteClonedEmoji", "deleteClonedSticker", "isSendCooldownError", "SLOWMODE_REPLY_RETRY_DELAY_MS", "wait", `${code}; return sendReplyToNoticeWithCooldownRetry;`)(
+    const send = new Function("settings", "uploadReplyAttachment", "prepareCloneFallback", "sendReplyToNotice", "deleteClonedEmoji", "deleteClonedSticker", "isSendCooldownError", "SLOWMODE_REPLY_RETRY_DELAY_MS", "wait", "lifecycleGeneration", "getRestErrorBody", `${code}; return sendReplyToNoticeWithCooldownRetry;`)(
         { store: { enableCloneFallback: false, cloneServerGuildId: "staging" } }, async() => null, prepareCloneFallback, sendReplyToNotice,
-        async asset => cleaned.push(asset.id), async asset => cleaned.push(asset.id), () => false, 1, async() => {}
+        async asset => cleaned.push(asset.id), async asset => cleaned.push(asset.id), () => false, 1, async() => {}, 0, () => null
     );
     const notice = { channelId: "channel" };
     await send(notice, "reply", ["original-id"]);
@@ -294,14 +295,32 @@ async function testOriginalStickerUsesSharedSendAndOptionalCloneFallback() {
     assert.equal(originalCalls.length, 0, "the user's disabled fallback setting is respected");
 
     stagingEnabled = true;
-    const withFallback = new Function("settings", "uploadReplyAttachment", "prepareCloneFallback", "sendReplyToNotice", "deleteClonedEmoji", "deleteClonedSticker", "isSendCooldownError", "SLOWMODE_REPLY_RETRY_DELAY_MS", "wait", `${code}; return sendReplyToNoticeWithCooldownRetry;`)(
+    const withFallback = new Function("settings", "uploadReplyAttachment", "prepareCloneFallback", "sendReplyToNotice", "deleteClonedEmoji", "deleteClonedSticker", "isSendCooldownError", "SLOWMODE_REPLY_RETRY_DELAY_MS", "wait", "lifecycleGeneration", "getRestErrorBody", `${code}; return sendReplyToNoticeWithCooldownRetry;`)(
         { store: { enableCloneFallback: true, cloneServerGuildId: "staging" } }, async() => null, prepareCloneFallback, sendReplyToNotice,
-        async asset => cleaned.push(asset.id), async asset => cleaned.push(asset.id), () => false, 1, async() => {}
+        async asset => cleaned.push(asset.id), async asset => cleaned.push(asset.id), () => false, 1, async() => {}, 0, () => null
     );
     await withFallback(notice, "reply", ["original-id"]);
     assert.deepEqual(originalCalls[0], ["original-id"], "fallback receives the exact original sticker before any remapping");
     assert.deepEqual(sent[1].stickerIds, ["staged-id"]);
     assert.deepEqual(cleaned, ["staged-id"]);
+}
+
+async function testRestartDuringScanStillRerunsAndStopDoesNot() {
+    const code = getFunction("loadUnreadMentions");
+    for (const restarted of [true, false]) {
+        let release; const gate = new Promise(r => { release = r; });
+        const scheduled = [];
+        const s = { generation: 0, running: false, again: false, started: true };
+        const load = new Function("s", "fetchRecentMentionMessages", "fetchKeywordNotifierMentionMessages", "setUnreadMentionsLoading", "scheduleUnreadMentionsLoad", "syncUnreadNotices", "getStoredMentionsLimit", "sortNoticesNewestFirst", "hydrateNoticeReplyChain", "ChannelStore", "buildNoticeFromMessage", `
+            let isUnreadMentionsLoadRunning = false, shouldRunUnreadMentionsLoadAgain = false;
+            const lifecycleGeneration = 0; ${code.replace(/lifecycleGeneration/g, "s.generation").replace(/pluginStarted/g, "s.started").replace(/isUnreadMentionsLoadRunning/g, "s.running").replace(/shouldRunUnreadMentionsLoadAgain/g, "s.again")};
+            return loadUnreadMentions;`)(s, async () => { await gate; return []; }, async () => [], () => {}, (...args) => scheduled.push(args), () => {}, () => 10, list => list, async n => n, {}, () => null);
+        const first = load();
+        s.generation++; s.started = restarted; // stop(), then maybe start()
+        if (restarted) await load(); // new lifecycle's load sees running flag and queues a rerun
+        release(); await first;
+        assert.equal(scheduled.length, restarted ? 1 : 0, "rerun is kept across restart and dropped after stop");
+    }
 }
 
 (async() => {
@@ -318,6 +337,7 @@ async function testOriginalStickerUsesSharedSendAndOptionalCloneFallback() {
     await testEditFailureNeverFallsThroughToPost();
     await testPendingSendIdentityIsAwaitedBeforePatch();
     await testOriginalStickerUsesSharedSendAndOptionalCloneFallback();
+    await testRestartDuringScanStillRerunsAndStopDoesNot();
     console.log("MentionsBox production notice lifecycle checks passed");
 })().catch(error => {
     console.error(error);

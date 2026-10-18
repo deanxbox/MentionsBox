@@ -49,10 +49,9 @@ import {
     useRef,
     UserSettingsProtoStore,
     UserStore,
+    UserUtils,
     useState,
-    useStateFromStores,
-    UserUtils
-} from "@webpack/common";
+    useStateFromStores } from "@webpack/common";
 
 import { filterAndSortNotices, getNextNoticeId, type MentionFilter } from "./manager";
 import { getPlaceholderAutocompleteOptionId, PLACEHOLDER_AUTOCOMPLETE_ID, PlaceholderAutocomplete, type ReplyAutocompletePosition } from "./PlaceholderAutocomplete";
@@ -225,6 +224,8 @@ const Dean: PluginAuthor = {
 const ROOT_ID = "vc-mentions-box-root";
 const RECENT_MENTIONS_ENDPOINT = "/users/@me/mentions";
 const KEYWORD_NOTIFIER_LOG_KEY = "KeywordNotify_log";
+const REPLY_CHAIN_STORE_KEY = "MentionsBox_replyChains";
+const REPLY_CHAIN_STORE_LIMIT = 300;
 const RECENT_MENTIONS_PAGE_LIMIT = 100;
 const RECENT_MENTIONS_MAX_PAGES = 10;
 const DEFAULT_EXPIRATION_MINUTES = 10;
@@ -754,6 +755,7 @@ const settings = definePluginSettings({
 
 let root: ReturnType<typeof createRoot> | null = null;
 let pluginStarted = false;
+let lifecycleGeneration = 0;
 let notices: MentionNotice[] = [];
 const discardedNoticeHistory: NoticeUndoEntry[] = [];
 const restoredReplyEntries = new Map<string, NoticeUndoEntry>();
@@ -2091,13 +2093,39 @@ function collectReplyChain(message: MessageJSON | any) {
     return chain;
 }
 
+let storedReplyChains: Record<string, ReplyPreview[]> | null = null;
+
+async function getStoredReplyChains() {
+    storedReplyChains ??= await DataStore.get(REPLY_CHAIN_STORE_KEY).catch(() => null) ?? {};
+    return storedReplyChains!;
+}
+
+async function persistReplyChain(noticeId: string, chain: ReplyPreview[]) {
+    const store = await getStoredReplyChains();
+    delete store[noticeId]; // re-insert so the newest entries survive trimming
+    store[noticeId] = chain;
+    for (const key of Object.keys(store).slice(0, Math.max(0, Object.keys(store).length - REPLY_CHAIN_STORE_LIMIT))) delete store[key];
+    await DataStore.set(REPLY_CHAIN_STORE_KEY, store).catch(() => { });
+}
+
 async function hydrateNoticeReplyChain(notice: MentionNotice, sourceMessage?: any, updateStore = true): Promise<MentionNotice> {
     if (notice.kind === "reaction" || notice.kind === "typing") return notice;
+
+    const stored = (await getStoredReplyChains())[notice.id];
+    if (stored?.length && notice.replyChain.length < stored.length) {
+        const immediate = stored.at(-1)!;
+        notice = { ...notice, replyChain: stored, referencedContent: immediate.content, referencedAuthorName: immediate.authorName };
+        if (updateStore) {
+            setNotices(notices.map(n => n.id === notice.id && n.channelId === notice.channelId && n.replyChain.length < stored.length ? { ...n, replyChain: stored, referencedContent: immediate.content, referencedAuthorName: immediate.authorName } : n));
+        }
+        return notice;
+    }
 
     const root = sourceMessage ?? MessageStore.getMessage(notice.channelId, notice.id);
     if (!root || !getMessageReference(root)) return notice;
 
     const seen = new Set<string>();
+    const walked: any[] = [];
     let current = root;
 
     while (seen.size < 8) {
@@ -2123,12 +2151,17 @@ async function hydrateNoticeReplyChain(notice: MentionNotice, sourceMessage?: an
         }
 
         if (!referenced) break;
+        walked.push(referenced);
         current = referenced;
     }
 
-    const replyChain = collectReplyChain(root);
+    // Built from the fetched messages directly: after a restart the MessageStore may not retain them.
+    const walkedChain = walked.map(makeReplyPreview).filter(Boolean).reverse() as ReplyPreview[];
+    const storeChain = collectReplyChain(root);
+    const replyChain = walkedChain.length > storeChain.length ? walkedChain : storeChain;
     const immediateReply = replyChain.at(-1);
     if (!immediateReply) return notice;
+    void persistReplyChain(notice.id, replyChain);
 
     const hydratedNotice = {
         ...notice,
@@ -2153,14 +2186,33 @@ async function hydrateNoticeReplyChain(notice: MentionNotice, sourceMessage?: an
     return hydratedNotice;
 }
 
-function ReplyChain({ replies }: { replies: ReplyPreview[]; }) {
+function jumpToReply(reply: ReplyPreview, fallbackChannelId: string) {
+    const channelId = reply.channelId ?? fallbackChannelId;
+    const guildId = ChannelStore.getChannel(channelId)?.guild_id ?? "@me";
+    // Intentionally leaves the notice unread and the MentionsBox open.
+    NavigationRouter.transitionTo(`/channels/${guildId}/${channelId}/${reply.id}`);
+}
+
+function ReplyChain({ replies, channelId }: { replies: ReplyPreview[]; channelId: string; }) {
     if (!replies.length) return null;
 
     return (
         <div className="vc-mentions-box-thread vc-mentions-box-reply-chain">
             <div className="vc-mentions-box-thread-heading">Reply chain</div>
             {replies.map(reply => (
-                <div className="vc-mentions-box-thread-item" key={reply.id}>
+                <div
+                    className="vc-mentions-box-thread-item"
+                    key={reply.id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={event => { event.stopPropagation(); jumpToReply(reply, channelId); }}
+                    onKeyDown={event => {
+                        if (event.key !== "Enter" && event.key !== " ") return;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        jumpToReply(reply, channelId);
+                    }}
+                >
                     {reply.avatarUrl ? (
                         <img className="vc-mentions-box-thread-avatar" src={reply.avatarUrl} alt="" />
                     ) : (
@@ -2243,6 +2295,12 @@ function shouldAutoReadBotMention(message: MessageJSON | any) {
     );
 }
 
+// Covers replies with the ping toggled off, which Discord doesn't list in mentions.
+function isReplyToCurrentUser(message: MessageJSON | any, userId: string) {
+    const referenced = getReferencedMessage(message);
+    return (referenced?.author?.id ?? referenced?.authorId) === userId;
+}
+
 function isRelevantMention(message: MessageJSON | any) {
     const currentUser = UserStore.getCurrentUser();
 
@@ -2250,6 +2308,7 @@ function isRelevantMention(message: MessageJSON | any) {
     if (settings.store.hideBotMentions && message.author.bot) return false;
 
     return messageMentionsUser(message, currentUser.id)
+        || isReplyToCurrentUser(message, currentUser.id)
         || isReplyToRememberedChain(message)
         || isReplyToMessageMentioningUser(message, currentUser.id);
 }
@@ -2623,6 +2682,7 @@ function isSendCooldownError(error: any) {
 }
 
 async function sendReplyToNoticeWithCooldownRetry(notice: MentionNotice, content: string, stickerIds: string[] = [], files: ReplyFile[] = []) {
+    const generation = lifecycleGeneration;
     const uploads = await Promise.all(files.map(file => uploadReplyAttachment(file, notice.channelId)));
 
     const clonedAssets: ClonedAsset[] = [];
@@ -2638,11 +2698,13 @@ async function sendReplyToNoticeWithCooldownRetry(notice: MentionNotice, content
 
     try {
         for (;;) {
+            if (generation !== lifecycleGeneration) throw new Error("MentionsBox stopped before reply was sent");
             try {
                 return await sendReplyToNotice(notice, content, stickerIds, uploads);
             } catch (error) {
                 if (!isSendCooldownError(error)) throw error;
-                await wait(SLOWMODE_REPLY_RETRY_DELAY_MS);
+                const retryAfter = Number(getRestErrorBody(error)?.retry_after);
+                await wait(retryAfter > 0 ? Math.max(SLOWMODE_REPLY_RETRY_DELAY_MS, Math.ceil(retryAfter * 1000)) : SLOWMODE_REPLY_RETRY_DELAY_MS);
             }
         }
     } finally {
@@ -2686,6 +2748,7 @@ function isMessageTooOld(message: any, cutoff: number) {
 async function fetchRecentMentionMessages() {
     const cutoff = getMentionLoadCutoff();
     const foundMessages: LoadedRecentMentionMessage[] = [];
+    const generation = lifecycleGeneration;
     let before: string | undefined;
 
     for (let page = 0; page < RECENT_MENTIONS_MAX_PAGES && foundMessages.length < getStoredMentionsLimit(); page++) {
@@ -2706,6 +2769,7 @@ async function fetchRecentMentionMessages() {
             },
             retries: 1
         }).catch(() => null);
+        if (generation !== lifecycleGeneration) return [];
         const batch = Array.isArray(response?.body) ? response.body : [];
         if (!batch.length) break;
 
@@ -2745,7 +2809,9 @@ async function fetchKeywordNotifierMentionMessages() {
     if (!currentUser) return [];
 
     const foundMessages: LoadedRecentMentionMessage[] = [];
+    const generation = lifecycleGeneration;
     const keywordMessages = await getKeywordNotifierMessages();
+    if (generation !== lifecycleGeneration) return [];
     keywordNotifierMentionIds = new Set(
         keywordMessages.map(message => message.id ?? message.message_id ?? message.messageId).filter(Boolean)
     );
@@ -2787,14 +2853,15 @@ async function loadUnreadMentions() {
         return;
     }
     isUnreadMentionsLoadRunning = true;
+    const generation = lifecycleGeneration;
     setUnreadMentionsLoading(true, "Scanning for unread mentions…");
     const unreadNotices: MentionNotice[] = [];
 
     try {
-        const loadedMessages = [
-            ...await fetchRecentMentionMessages(),
-            ...await fetchKeywordNotifierMentionMessages()
-        ];
+        const recentMessages = await fetchRecentMentionMessages();
+        if (generation !== lifecycleGeneration) return;
+        const loadedMessages = [...recentMessages, ...await fetchKeywordNotifierMentionMessages()];
+        if (generation !== lifecycleGeneration) return;
         const seenMessageIds = new Set<string>();
         const sourceMessages = new Map<string, any>();
 
@@ -2817,19 +2884,25 @@ async function loadUnreadMentions() {
             }
         }
 
-        const hydratedNotices = await Promise.all(unreadNotices.map(notice =>
-            hydrateNoticeReplyChain(notice, sourceMessages.get(notice.id), false)
-        ));
-        syncUnreadNotices(hydratedNotices);
+        // Only hydrate notices that can survive the stored-mentions limit, in small batches.
+        const candidates = sortNoticesNewestFirst(unreadNotices).slice(0, getStoredMentionsLimit());
+        const hydratedNotices: MentionNotice[] = [];
+        for (let i = 0; i < candidates.length; i += 5) {
+            if (generation !== lifecycleGeneration) return;
+            hydratedNotices.push(...await Promise.all(candidates.slice(i, i + 5).map(notice =>
+                hydrateNoticeReplyChain(notice, sourceMessages.get(notice.id), false)
+            )));
+        }
+        if (generation === lifecycleGeneration) syncUnreadNotices(hydratedNotices);
     } catch (error) {
         console.error("[MentionsBox] Failed to load unread mentions", error);
     } finally {
         isUnreadMentionsLoadRunning = false;
         setUnreadMentionsLoading(false);
-        if (shouldRunUnreadMentionsLoadAgain) {
-            shouldRunUnreadMentionsLoadAgain = false;
-            scheduleUnreadMentionsLoad(250, true);
-        }
+        const shouldRerun = shouldRunUnreadMentionsLoadAgain;
+        shouldRunUnreadMentionsLoadAgain = false;
+        // pluginStarted (not generation): a restart's load may have queued this rerun while the stale load was still running.
+        if (shouldRerun && pluginStarted) scheduleUnreadMentionsLoad(250, true);
     }
 }
 
@@ -4467,7 +4540,9 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     }, [markCurrentNoticeRead]);
 
     const sendReplyInBackground = useCallback((content: string, stickerIds: string[], failureMessage: string, delayMs: number, files: ReplyFile[] = [], undoEntry?: NoticeUndoEntry) => {
+        const generation = lifecycleGeneration;
         const sendPromise = new Promise<string>(resolve => window.setTimeout(() => {
+            if (generation !== lifecycleGeneration) return resolve("");
             void sendReplyToNoticeWithCooldownRetry(notice, content, stickerIds, files).then(messageId => {
                 if (undoEntry && messageId) {
                     undoEntry.sentMessageId = messageId;
@@ -4476,6 +4551,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
                 resolve(messageId);
             }).catch(error => {
                 console.error("[MentionsBox] Failed to send reply in background", error);
+                if (generation !== lifecycleGeneration) return resolve("");
                 if (undoEntry) {
                     undoEntry.sendFailed = true;
                     const historyIndex = discardedNoticeHistory.indexOf(undoEntry);
@@ -5353,7 +5429,7 @@ Right-click to delete this response`}
                                 </div>
                             </div>
                         )}
-                        {isReplyExpanded && replyChain.length > 0 && <ReplyChain replies={replyChain} />}
+                        {isReplyExpanded && replyChain.length > 0 && <ReplyChain replies={replyChain} channelId={notice.channelId} />}
                         {isReplyExpanded && !replyChain.length && notice.referencedAuthorName && (
                             <div className="vc-mentions-box-ref">
                                 ↩ <span className="vc-mentions-box-ref-author">{notice.referencedAuthorName}</span>: {notice.referencedContent}
@@ -5951,6 +6027,7 @@ export default definePlugin({
 
     stop() {
         pluginStarted = false;
+        lifecycleGeneration++;
         document.removeEventListener("keydown", globalKeydownListener, true);
         if (pruneInterval) clearInterval(pruneInterval);
         if (unreadLoadTimeout) clearTimeout(unreadLoadTimeout);

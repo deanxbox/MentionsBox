@@ -1533,25 +1533,35 @@
 }
 
 .vc-mentions-box-reply-chain .vc-mentions-box-thread-item {
-    grid-template-columns: 22px minmax(0, 1fr);
-    gap: 6px;
+    grid-template-columns: 32px minmax(0, 1fr);
+    gap: 10px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.vc-mentions-box-reply-chain .vc-mentions-box-thread-item:hover {
+    background: var(--background-modifier-hover, rgba(128, 132, 142, 0.16));
 }
 
 .vc-mentions-box-reply-chain .vc-mentions-box-thread-avatar {
-    width: 20px;
-    height: 20px;
+    width: 32px;
+    height: 32px;
 }
 
 .vc-mentions-box-reply-chain .vc-mentions-box-thread-author {
-    font-size: 11px;
-    line-height: 14px;
+    font-size: 14px;
+    line-height: 18px;
 }
 
 .vc-mentions-box-reply-chain .vc-mentions-box-thread-content {
-    font-size: 11px;
-    line-height: 14px;
+    font-size: 14px;
+    line-height: 18px;
+    overflow: visible;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
+    white-space: pre-wrap;
 }
-
 
 .vc-mentions-box-thread-group {
     display: flex;
@@ -2615,7 +2625,7 @@
         height: 34px;
     }
 
-    .vc-mentions-box-jump {
+    .vc-mentions-box-card:not(:has(.vc-mentions-box-main--jump-disabled)) .vc-mentions-box-jump {
         display: none;
     }
 
@@ -2723,6 +2733,8 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+    .vc-mentions-box-keybind-toast,
+    .vc-mentions-box-loading-bar { animation: none; }
     .vc-mentions-box-card,
     .vc-mentions-box-manager-button { transition: none; }
     .vc-mentions-box-card:hover,

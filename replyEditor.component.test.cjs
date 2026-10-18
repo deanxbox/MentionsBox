@@ -32,12 +32,15 @@ const common = `
     export const ChannelStore = { getChannel: () => null }, GuildStore = {}, MessageStore = {}, ReadStateStore = {}, UserSettingsProtoStore = {};
     export const FluxDispatcher = { dispatch: () => {} }, Forms = {}, Menu = {}, Modal = {}, NavigationRouter = {}, Constants = { GLOBAL_ENV: { MEDIA_PROXY_ENDPOINT: 'https://media.discordapp.net', CDN_HOST: 'cdn.discordapp.com' }, Endpoints: { MESSAGES: id => '/channels/' + id + '/messages' } }, RestAPI = { post: options => { window.sentBodies.push(options.body); return Promise.resolve({ body: { id: 'sent' } }); } };
     export const PermissionsBits = {}, PermissionStore = {}, Select = () => null;
+    export const PresenceStore = { getStatus: () => 'online', getClientStatus: () => ({ desktop: 'online' }) }, UserUtils = { getUser: () => Promise.resolve({}) };
     export const openMediaModal = () => {}, openModal = () => {};
 `;
 const stubs = {
     "@webpack/common": common,
     "@webpack": `import { emoji } from '@webpack/common';
-        export const findByPropsLazy = key => key === 'convertSurrogateToName'
+        export const findByPropsLazy = key => key === 'openUserProfileModal'
+            ? { openUserProfileModal: () => { window.profileOpened = true; } }
+            : key === 'convertSurrogateToName'
             ? { convertSurrogateToName: value => value === '😭' ? 'sob' : null, getByName: name => name === 'sob' ? emoji : null }
             : { getURL: () => emoji.url };
         export const findCssClassesLazy = () => ({}), findLazy = () => null, findByCodeLazy = () => null;`,
@@ -75,7 +78,8 @@ async function bundle() {
             const notice = { id: 'notice', kind: 'mention', channelId: 'channel', guildId: null, channelName: 'test', authorId: '123', authorName: 'Mason Plebanek', authorUsername: 'Mason Plebanek', authorDisplayName: 'Mason Plebanek', content: '<@123> test 😭', messageText: '<@123> test 😭', timestamp: Date.now(), media: [{ id: 'image', kind: 'image', url: ${JSON.stringify(emojiUrl)}, label: 'Image' }], replyChain: [{ id: 'reply', authorName: 'Mason Plebanek', content: 'Reply chain 😭', media: [] }], originalSticker: { id: '789', name: 'Wave', formatType: 1 } };
             const root = createRoot(document.getElementById('mount'));
             let key = 0;
-            window.mountCard = () => root.render(React.createElement(MentionCard, { key: ++key, notice }));
+            // Fresh id per mount: unsent drafts are intentionally preserved per notice id.
+            window.mountCard = () => root.render(React.createElement(MentionCard, { key: ++key, notice: { ...notice, id: 'notice-' + key } }));
             window.editorRaw = () => serializeReplyContent(document.querySelector('.vc-mentions-box-reply-input'));
             window.selectRaw = (start, end, reverse = false) => { const el = document.querySelector('.vc-mentions-box-reply-input'); el.focus(); setReplySelectionOffsets(el, start, end); if (reverse) { const s = getSelection(); s.setBaseAndExtent(s.focusNode, s.focusOffset, s.anchorNode, s.anchorOffset); } };
             window.mountCard();`, resolveDir: __dirname, loader: "tsx" },
@@ -275,7 +279,7 @@ async function frames(page) {
             assert.ok(Math.abs(measurements.referenceSize.height - 22) <= 0.1, "16px inline emoji height is 22px");
         }
         if (!before) {
-            assert.equal(measurements.notice.avatarHeight, 13, "notice rule must not override MentionAvatars sizing");
+            assert.equal(measurements.notice.avatarHeight, measurements.notice.emojiFontSize, "notice rule must not override MentionAvatars sizing (scales with font size)");
             assert.equal(measurements.editor.tokenRaw, "<@123>");
             const mention = editor.locator('.mention.interactive[data-raw="<@123>"]');
             assert.equal(await mention.getAttribute("contenteditable"), "false");
