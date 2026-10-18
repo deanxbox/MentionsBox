@@ -1125,8 +1125,6 @@
     gap: 2px;
     overflow-y: auto;
     padding: 0 10px 12px;
-    scrollbar-color: var(--background-modifier-accent) transparent;
-    scrollbar-width: thin;
 }
 
 .vc-mentions-box-emoji-button {
@@ -2739,4 +2737,197 @@
     .vc-mentions-box-manager-button { transition: none; }
     .vc-mentions-box-card:hover,
     .vc-mentions-box-card:focus-within { transform: none; }
+}
+
+.vc-mentions-box-thread-avatar-wrap {
+    cursor: pointer;
+    border-radius: 50%;
+}
+
+.vc-mentions-box-message-reaction-parsed {
+    display: inline-flex;
+    align-items: center;
+}
+
+.vc-mentions-box-message-reaction-parsed p {
+    margin: 0;
+}
+
+.vc-mentions-box-reactor-list {
+    max-width: 240px;
+    max-height: 240px;
+    overflow: hidden;
+    text-align: left;
+}
+
+.vc-mentions-box-reactor-heading {
+    margin-bottom: 2px;
+    font-weight: 700;
+}
+
+.vc-mentions-box-thread-avatar-wrap {
+    display: grid;
+    width: 32px;
+    height: 32px;
+}
+
+.vc-mentions-box-thread-avatar-wrap:hover {
+    outline: 2px solid var(--brand-500);
+    outline-offset: 2px;
+}
+
+.vc-mentions-box-reactions .vc-mentions-box-reaction-more svg {
+    display: block;
+}
+
+.vc-mentions-box-picker-tabs {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 6px;
+    padding: 12px 12px 0;
+}
+
+.vc-mentions-box-picker-tab {
+    height: 30px;
+    padding: 0 12px;
+    color: var(--text-muted);
+    font-size: 14px;
+    font-weight: 600;
+    background: transparent;
+    border: 0;
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.vc-mentions-box-picker-tab:hover,
+.vc-mentions-box-picker-tab-active {
+    color: var(--white-500);
+    background: var(--background-modifier-selected, var(--background-modifier-hover));
+}
+
+.vc-mentions-box-gif-grid {
+    display: grid;
+    flex: 1 1 auto;
+    min-height: 0;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-auto-rows: 120px;
+    gap: 8px;
+    overflow-y: auto;
+    padding: 10px;
+}
+
+.vc-mentions-box-gif {
+    position: relative;
+    overflow: hidden;
+    padding: 0;
+    background: var(--background-secondary, #2b2d31);
+    border: 0;
+    border-radius: 6px;
+    cursor: pointer;
+}
+
+.vc-mentions-box-gif img,
+.vc-mentions-box-gif video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+/* Discord-style thin rounded scrollbars for the picker panels */
+.vc-mentions-box-emoji-grid,
+.vc-mentions-box-gif-grid {
+    scrollbar-width: auto;
+    scrollbar-color: auto;
+}
+
+.vc-mentions-box-emoji-grid::-webkit-scrollbar,
+.vc-mentions-box-gif-grid::-webkit-scrollbar {
+    width: 14px;
+}
+
+.vc-mentions-box-emoji-grid::-webkit-scrollbar-track,
+.vc-mentions-box-gif-grid::-webkit-scrollbar-track {
+    background: transparent;
+    border: 4px solid transparent;
+    background-clip: padding-box;
+    border-radius: 8px;
+}
+
+.vc-mentions-box-emoji-grid::-webkit-scrollbar-thumb,
+.vc-mentions-box-gif-grid::-webkit-scrollbar-thumb {
+    min-height: 40px;
+    background: var(--scrollbar-thin-thumb, var(--background-modifier-accent));
+    background-clip: padding-box;
+    border: 4px solid transparent;
+    border-radius: 8px;
+}
+
+.vc-mentions-box-picker-buttons {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+}
+
+.vc-mentions-box-gif-badge {
+    padding: 2px 4px;
+    font-size: 11px;
+    font-weight: 800;
+    line-height: 1;
+    letter-spacing: 0.02em;
+    background: var(--background-modifier-accent);
+    border-radius: 4px;
+}
+
+.vc-mentions-box-sticker-lottie {
+    overflow: hidden;
+}
+
+.vc-mentions-box-gif-grid {
+    display: block;
+    columns: 2;
+    column-gap: 8px;
+}
+
+.vc-mentions-box-gif {
+    display: block;
+    width: 100%;
+    margin: 0 0 8px;
+    break-inside: avoid;
+}
+
+.vc-mentions-box-gif img,
+.vc-mentions-box-gif video {
+    display: block;
+    object-fit: contain;
+}
+
+.vc-mentions-box-gif-grid > .vc-mentions-box-sticker-empty {
+    column-span: all;
+}
+.vc-mentions-box-gif img,
+.vc-mentions-box-gif video {
+    width: 100%;
+    height: 100%;
+}
+.vc-mentions-box-gif-grid {
+    display: flex;
+    columns: auto;
+    align-items: flex-start;
+    gap: 8px;
+}
+
+.vc-mentions-box-gif-col {
+    display: flex;
+    min-width: 0;
+    flex: 1;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.vc-mentions-box-gif {
+    margin: 0;
+}
+
+.vc-mentions-box-gif-grid > .vc-mentions-box-sticker-empty {
+    width: 100%;
 }

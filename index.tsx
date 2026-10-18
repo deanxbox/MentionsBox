@@ -42,6 +42,7 @@ import {
     Select,
     SelectedChannelStore,
     StickersStore,
+    Tooltip,
     useCallback,
     useEffect,
     useLayoutEffect,
@@ -96,6 +97,7 @@ interface MessageReactionPayload {
 interface ReplyPreview {
     id: string;
     authorName: string;
+    authorId?: string;
     avatarUrl?: string;
     content: string;
     channelId?: string;
@@ -1869,6 +1871,195 @@ function MessageMedia({ media, compact = false }: { media: MessageMediaPreview[]
     );
 }
 
+function StickerIcon() {
+    return (
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M20 12V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v10a3 3 0 0 0 3 3h5l8-8z" />
+            <path d="M20 12h-4a3 3 0 0 0-3 3v5" />
+            <circle cx="9" cy="10" r="1" fill="currentColor" stroke="none" />
+            <circle cx="14" cy="10" r="1" fill="currentColor" stroke="none" />
+        </svg>
+    );
+}
+
+function PickerIcon() {
+    return (
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9.5" />
+            <path d="M8 14.5c1 1.5 2.3 2.2 4 2.2s3-.7 4-2.2" />
+            <circle cx="9" cy="10" r="1" fill="currentColor" stroke="none" />
+            <circle cx="15" cy="10" r="1" fill="currentColor" stroke="none" />
+        </svg>
+    );
+}
+
+function GifTile({ gif, onSelect }: { gif: { url: string; src: string; isVideo: boolean; width?: number; height?: number; title?: string; }; onSelect(url: string): void; }) {
+    const ref = useRef<HTMLButtonElement>(null);
+    const [visible, setVisible] = useState(false);
+
+    useEffect(() => {
+        const el = ref.current;
+        if (!el) return;
+        const observer = new IntersectionObserver(([entry]) => setVisible(entry.isIntersecting), { root: el.closest(".vc-mentions-box-gif-grid"), rootMargin: "200px" });
+        observer.observe(el);
+        return () => observer.disconnect();
+    }, []);
+
+    return (
+        <button
+            ref={ref}
+            type="button"
+            className="vc-mentions-box-gif"
+            title={gif.title}
+            style={{ aspectRatio: gif.width && gif.height ? gif.width + " / " + gif.height : "1 / 1" }}
+            onClick={() => onSelect(gif.url)}
+        >
+            {visible && (gif.isVideo
+                ? <video src={gif.src} muted loop autoPlay playsInline preload="metadata" />
+                : <img src={gif.src} alt={gif.title ?? ""} decoding="async" />)}
+        </button>
+    );
+}
+
+function MentionGifPicker({ onSelect }: { onSelect(url: string): void; }) {
+    const [query, setQuery] = useState("");
+    const favoriteGifs = useStateFromStores([UserSettingsProtoStore], () => {
+        const gifs = (UserSettingsProtoStore.frecencyWithoutFetchingLatest as any)?.favoriteGifs?.gifs ?? {};
+        return Object.entries<any>(gifs)
+            .sort(([, a], [, b]) => (b.order ?? 0) - (a.order ?? 0))
+            .map(([url, gif]) => ({ url, src: gif.src ?? url, isVideo: gif.format === 2, width: gif.width, height: gif.height }));
+    });
+    const [view, setView] = useState<"favorites" | "trending">(() => favoriteGifs.length ? "favorites" : "trending");
+    const showFavorites = !query.trim() && view === "favorites";
+    const [gifs, setGifs] = useState<any[] | null>(null);
+    const [failed, setFailed] = useState(false);
+
+    useEffect(() => {
+        if (showFavorites) return;
+        let cancelled = false;
+        setGifs(null);
+        setFailed(false);
+        const q = query.trim();
+        const timeout = setTimeout(() => {
+            const endpoints = Constants.Endpoints as any;
+            RestAPI.get({
+                url: q ? endpoints.GIFS_SEARCH : endpoints.GIFS_TRENDING_GIFS,
+                query: { ...(q ? { q } : {}), media_format: "mp4", locale: navigator.language }
+            }).then(response => {
+                if (cancelled) return;
+                const body = response?.body;
+                setGifs((Array.isArray(body) ? body : body?.gifs ?? []).slice(0, 60));
+            }).catch(() => !cancelled && setFailed(true));
+        }, q ? 350 : 0);
+        return () => { cancelled = true; clearTimeout(timeout); };
+    }, [query, showFavorites]);
+
+    const items = showFavorites ? favoriteGifs : (gifs ?? []).map((gif: any) => ({
+        url: gif.url, title: gif.title, width: gif.width, height: gif.height,
+        ...(gif.gif_src ? { src: gif.gif_src, isVideo: false } : { src: gif.src, isVideo: true })
+    }));
+    const tiles = items.map((gif: any, i: number) => <GifTile key={gif.url ?? i} gif={gif} onSelect={onSelect} />);
+    const message = showFavorites
+        ? (favoriteGifs.length ? null : "No favourite GIFs. Favourite GIFs in Discord to show them here.")
+        : failed ? "Couldn't load GIFs." : !gifs ? "Loading GIFs…" : !gifs.length ? "No GIFs found." : null;
+
+    return (
+        <>
+            <div className="vc-mentions-box-emoji-picker-header">
+                <div className="vc-mentions-box-emoji-search-wrap">
+                    <span className="vc-mentions-box-emoji-search-icon">🔍</span>
+                    <input
+                        className="vc-mentions-box-emoji-search"
+                        placeholder="Search GIFs"
+                        value={query}
+                        onChange={event => setQuery(event.currentTarget.value)}
+                        onKeyDown={event => event.stopPropagation()}
+                        autoFocus
+                    />
+                </div>
+            </div>
+            {!query.trim() && (
+                <div className="vc-mentions-box-sticker-tabs">
+                    <StickerPickerTab active={view === "favorites"} onClick={() => setView("favorites")}>Favourites ({favoriteGifs.length})</StickerPickerTab>
+                    <StickerPickerTab active={view === "trending"} onClick={() => setView("trending")}>Trending</StickerPickerTab>
+                </div>
+            )}
+            <div className="vc-mentions-box-gif-grid">
+                {message ? <div className="vc-mentions-box-sticker-empty">{message}</div> : [0, 1].map(column => (
+                    <div key={column} className="vc-mentions-box-gif-col">
+                        {tiles.filter((_, i) => i % 2 === column)}
+                    </div>
+                ))}
+            </div>
+        </>
+    );
+}
+
+
+// Discord bundles lottie-web; the default sticker packs are mostly Lottie, which have no image URL.
+const Lottie = findByPropsLazy("loadAnimation");
+
+// cdn.discordapp.com sends no CORS header, so lottie-web's own XHR is refused; discord.com serves the same JSON same-origin.
+const lottieDataCache = new Map<string, Promise<object>>();
+
+function fetchLottieData(id: string) {
+    let data = lottieDataCache.get(id);
+    if (!data) {
+        data = fetch(location.origin + "/stickers/" + id + ".json").then(response => response.ok ? response.json() : Promise.reject(new Error("HTTP " + response.status)));
+        data.catch(() => lottieDataCache.delete(id));
+        lottieDataCache.set(id, data);
+    }
+    return data;
+}
+
+function LottieSticker({ id, name }: { id: string; name: string; }) {
+    const ref = useRef<HTMLDivElement>(null);
+    const [failed, setFailed] = useState(false);
+    const [visible, setVisible] = useState(false);
+
+    // Only animate cards near the viewport: mounting ~120 SVG animations at once is what made the tab lag.
+    useEffect(() => {
+        const el = ref.current;
+        if (!el) return;
+        const observer = new IntersectionObserver(([entry]) => setVisible(entry.isIntersecting), { root: el.closest(".vc-mentions-box-sticker-grid"), rootMargin: "120px" });
+        observer.observe(el);
+        return () => observer.disconnect();
+    }, []);
+
+    useEffect(() => {
+        const container = ref.current;
+        if (!container || !visible) return;
+        let cancelled = false;
+        let animation: any;
+        let button: Element | null = null;
+        const play = () => animation?.play();
+        const stop = () => animation?.goToAndStop(0, true);
+
+        fetchLottieData(id).then(animationData => {
+            if (cancelled) return;
+            if (typeof Lottie?.loadAnimation !== "function") throw new Error("lottie-web module not found");
+            animation = Lottie.loadAnimation({ container, renderer: "svg", loop: true, autoplay: false, animationData });
+            button = container.closest("button");
+            button?.addEventListener("mouseenter", play);
+            button?.addEventListener("mouseleave", stop);
+        }).catch(error => {
+            console.warn("[MentionsBox] Lottie sticker failed", id, error);
+            if (!cancelled) setFailed(true);
+        });
+
+        return () => {
+            cancelled = true;
+            button?.removeEventListener("mouseenter", play);
+            button?.removeEventListener("mouseleave", stop);
+            animation?.destroy();
+        };
+    }, [id, visible]);
+
+    return failed
+        ? <span className="vc-mentions-box-sticker-fallback">{name}</span>
+        : <div ref={ref} className="vc-mentions-box-sticker-img vc-mentions-box-sticker-lottie" />;
+}
+
 function StickerPickerTab({ active, onClick, children }: { active: boolean; onClick(): void; children: React.ReactNode; }) {
     return (
         <button
@@ -1894,19 +2085,17 @@ function MentionStickerPicker({ selectedId, onSelect, closePopout }: { selectedI
     });
 
     useEffect(() => {
-        if (loadedDefaultStickers.length > 0) return;
-
         let cancelled = false;
         void fetchDefaultReplyStickerPacks()
             .then(stickers => {
-                if (!cancelled && stickers.length > 0) setLoadedDefaultStickers(stickers);
+                if (!cancelled && stickers.length > 0) setLoadedDefaultStickers(current => [...new Map([...current, ...stickers].map(sticker => [sticker.id, sticker])).values()]);
             })
             .catch(error => console.error("[MentionsBox] Failed to fetch default sticker packs", error));
 
         return () => {
             cancelled = true;
         };
-    }, [loadedDefaultStickers.length]);
+    }, []);
 
     const defaultStickers = loadedDefaultStickers.length > 0 ? loadedDefaultStickers : getDefaultReplyStickers();
     const stickerMap = StickersStore.getAllGuildStickers?.();
@@ -1950,7 +2139,7 @@ function MentionStickerPicker({ selectedId, onSelect, closePopout }: { selectedI
                     />
                 </div>
             </div>
-            <div className="vc-mentions-box-sticker-tabs">
+            <div className="vc-mentions-box-sticker-tabs" onWheel={event => { event.currentTarget.scrollLeft += event.deltaY || event.deltaX; }}>
                 <StickerPickerTab active={selectedGroupId === "favorites"} onClick={() => setSelectedGroupId("favorites")}>
                     Favourites ({favoriteStickers.length})
                 </StickerPickerTab>
@@ -1993,7 +2182,11 @@ function MentionStickerPicker({ selectedId, onSelect, closePopout }: { selectedI
                             title={getStickerName(sticker)}
                             aria-pressed={selected}
                             >
-                                <PreviewImage key={stickerUrl} url={stickerUrl} imageClass="vc-mentions-box-sticker-img" fallbackClass="vc-mentions-box-sticker-fallback" fallback={getStickerName(sticker)} alt={getStickerName(sticker)} />
+                                {stickerUrl
+                                    ? <PreviewImage key={stickerUrl} url={stickerUrl} imageClass="vc-mentions-box-sticker-img" fallbackClass="vc-mentions-box-sticker-fallback" fallback={getStickerName(sticker)} alt={getStickerName(sticker)} />
+                                    : formatType === StickerFormatType.LOTTIE
+                                    ? <LottieSticker key={sticker.id} id={sticker.id} name={getStickerName(sticker)} />
+                                    : <span className="vc-mentions-box-sticker-fallback">{getStickerName(sticker)}</span>}
                                 <span className="vc-mentions-box-sticker-name">{getStickerName(sticker)}</span>
                             </button>
                         </div>
@@ -2042,6 +2235,7 @@ function makeReplyPreview(message: any): ReplyPreview | null {
     return {
         id,
         authorName,
+        authorId,
         avatarUrl: user?.getAvatarURL?.(undefined, 32) ?? buildRawAvatarUrl(message?.author, 32),
         content: content.length > REF_CONTENT_TRUNCATE_LENGTH
             ? `${content.slice(0, REF_CONTENT_TRUNCATE_LENGTH)}…`
@@ -2055,6 +2249,7 @@ function makeNoticeReplyPreview(notice: MentionNotice): ReplyPreview {
     return {
         id: notice.id,
         authorName: notice.authorName,
+        authorId: notice.authorId,
         avatarUrl: notice.avatarUrl,
         content: notice.content.length > REF_CONTENT_TRUNCATE_LENGTH
             ? `${notice.content.slice(0, REF_CONTENT_TRUNCATE_LENGTH)}…`
@@ -2112,7 +2307,8 @@ async function hydrateNoticeReplyChain(notice: MentionNotice, sourceMessage?: an
     if (notice.kind === "reaction" || notice.kind === "typing") return notice;
 
     const stored = (await getStoredReplyChains())[notice.id];
-    if (stored?.length && notice.replyChain.length < stored.length) {
+    // Chains saved before authorId existed are rebuilt so their avatars can open profiles.
+    if (stored?.length && notice.replyChain.length < stored.length && stored.every(reply => reply.authorId)) {
         const immediate = stored.at(-1)!;
         notice = { ...notice, replyChain: stored, referencedContent: immediate.content, referencedAuthorName: immediate.authorName };
         if (updateStore) {
@@ -2193,7 +2389,7 @@ function jumpToReply(reply: ReplyPreview, fallbackChannelId: string) {
     NavigationRouter.transitionTo(`/channels/${guildId}/${channelId}/${reply.id}`);
 }
 
-function ReplyChain({ replies, channelId }: { replies: ReplyPreview[]; channelId: string; }) {
+function ReplyChain({ replies, channelId, guildId }: { replies: ReplyPreview[]; channelId: string; guildId?: string | null; }) {
     if (!replies.length) return null;
 
     return (
@@ -2213,13 +2409,23 @@ function ReplyChain({ replies, channelId }: { replies: ReplyPreview[]; channelId
                         jumpToReply(reply, channelId);
                     }}
                 >
-                    {reply.avatarUrl ? (
-                        <img className="vc-mentions-box-thread-avatar" src={reply.avatarUrl} alt="" />
-                    ) : (
-                        <div className="vc-mentions-box-thread-avatar vc-mentions-box-thread-avatar-fallback">
-                            {reply.authorName.slice(0, 1).toUpperCase()}
-                        </div>
-                    )}
+                    <div
+                        className="vc-mentions-box-thread-avatar-wrap"
+                        title={reply.authorId ? `Open ${reply.authorName}'s profile` : undefined}
+                        onClick={reply.authorId ? event => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            void openProfile(reply.authorId!, { guildId, channelId: reply.channelId ?? channelId });
+                        } : undefined}
+                    >
+                        {reply.avatarUrl ? (
+                            <img className="vc-mentions-box-thread-avatar" src={reply.avatarUrl} alt="" />
+                        ) : (
+                            <div className="vc-mentions-box-thread-avatar vc-mentions-box-thread-avatar-fallback">
+                                {reply.authorName.slice(0, 1).toUpperCase()}
+                            </div>
+                        )}
+                    </div>
                     <div className="vc-mentions-box-thread-copy">
                         <div className="vc-mentions-box-thread-author">{reply.authorName}</div>
                         <div className="vc-mentions-box-thread-content">{renderMessageContent(reply.content, reply.channelId, reply.id)}</div>
@@ -4247,6 +4453,89 @@ function ReplyAutocompleteLayer({
     );
 }
 
+interface ReactorList { count: number; names: string[]; total: number; }
+const reactorCache = new Map<string, Promise<ReactorList>>();
+
+// Keyed by count so a live reaction add/remove refetches the list instead of showing stale names.
+function fetchReactors(notice: MentionNotice, reaction: StoredReaction): Promise<ReactorList> {
+    const key = `${notice.channelId}:${notice.id}:${getStoredReactionKey(reaction)}:${reaction.count}`;
+    let cached = reactorCache.get(key);
+    if (!cached) {
+        cached = RestAPI.get({
+            url: Constants.Endpoints.REACTIONS(notice.channelId, notice.id, getStoredReactionKey(reaction)),
+            query: { limit: 100, type: 0 },
+            retries: 1
+        }).then(response => {
+            const users: any[] = Array.isArray(response?.body) ? response.body : [];
+            const names = users.map(user =>
+                (notice.guildId ? GuildMemberStore.getNick(notice.guildId, user.id) : null)
+                ?? RelationshipStore.getNickname(user.id)
+                ?? user.global_name ?? user.globalName ?? user.username ?? "Unknown User"
+            );
+            return { count: users.length, names, total: reaction.count };
+        });
+        cached.catch(() => reactorCache.delete(key));
+        if (reactorCache.size > 200) reactorCache.delete(reactorCache.keys().next().value!);
+        reactorCache.set(key, cached);
+    }
+    return cached;
+}
+
+function ReactionEmoji({ emoji }: { emoji: StoredReaction["emoji"]; }) {
+    const [failed, setFailed] = useState(false);
+    const url = getEmojiImageUrl(emoji as any);
+    // Discord's parser renders its own emoji images, so a failed URL never shows a bare OS glyph.
+    if (failed || !url) {
+        return <span className="vc-mentions-box-message-reaction-parsed">
+            {renderMessageContent(emoji.id ? `<${emoji.animated ? "a" : ""}:${emoji.name}:${emoji.id}>` : emoji.name)}
+        </span>;
+    }
+    return <img className="vc-mentions-box-message-reaction-img" src={url} alt={emoji.id ? `:${emoji.name}:` : emoji.name} onError={() => setFailed(true)} />;
+}
+
+function NoticeReaction({ notice, reaction, isReacted }: { notice: MentionNotice; reaction: StoredReaction; isReacted: boolean; }) {
+    const [reactors, setReactors] = useState<ReactorList | "loading" | "error" | null>(null);
+    const emojiLabel = reaction.emoji.id ? `:${reaction.emoji.name}:` : reaction.emoji.name;
+
+    const load = () => {
+        setReactors("loading");
+        fetchReactors(notice, reaction).then(setReactors, () => setReactors("error"));
+    };
+
+    const tooltip = reactors === null || reactors === "loading" ? "Loading…"
+        : reactors === "error" ? "Couldn't load reactions"
+        : (
+            <div className="vc-mentions-box-reactor-list">
+                <div className="vc-mentions-box-reactor-heading">{emojiLabel}</div>
+                {reactors.names.map((name, i) => <div key={i}>{name}</div>)}
+                {reactors.total > reactors.count && <div>and {reactors.total - reactors.count} more</div>}
+            </div>
+        );
+
+    return (
+        <Tooltip text={tooltip}>
+            {(tooltipProps: any) => (
+                <button
+                    {...tooltipProps}
+                    type="button"
+                    className={`vc-mentions-box-message-reaction${isReacted ? " vc-mentions-box-message-reaction--mine" : ""}`}
+                    onMouseEnter={() => { tooltipProps.onMouseEnter?.(); load(); }}
+                    onClick={event => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        void setReactionOnNotice(notice, reaction.emoji as any, !isReacted);
+                    }}
+                    aria-label={`${isReacted ? "Remove" : "React with"} ${emojiLabel}`}
+                    aria-pressed={isReacted}
+                >
+                    <ReactionEmoji emoji={reaction.emoji} />
+                    <span className="vc-mentions-box-message-reaction-count">{reaction.count}</span>
+                </button>
+            )}
+        </Tooltip>
+    );
+}
+
 function ExternalReactionExpiry({ noticeId, durationMs, paused }: { noticeId: string; durationMs: number; paused: boolean; }) {
     const barRef = useRef<HTMLDivElement>(null);
 
@@ -4313,7 +4602,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     const [cursorPos, setCursorPos] = useState(0);
     const [autocompleteIndex, setAutocompleteIndex] = useState(0);
     const [showEmojiPicker, setShowEmojiPicker] = useState(false);
-    const [showStickerPicker, setShowStickerPicker] = useState(false);
+    const [pickerTab, setPickerTab] = useState<"gifs" | "stickers" | "emoji">("emoji");
     const [emojiSearch, setEmojiSearch] = useState("");
     const [hoveredEmoji, setHoveredEmoji] = useState<Emoji | null>(null);
     const [selectedSticker, setSelectedSticker] = useState<SelectedReplySticker>(() => getRestoredNoticeSticker(notice));
@@ -4329,13 +4618,10 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     const [contentOverflows, setContentOverflows] = useState(false);
     const [interactionNavIndex, setInteractionNavIndex] = useState<number | null>(null);
     const [pickerPos, setPickerPos] = useState<{ top: number; right: number; } | null>(null);
-    const [stickerPickerPos, setStickerPickerPos] = useState<{ top: number; right: number; } | null>(null);
     const cardRef = useRef<HTMLDivElement>(null);
     const replyInputRef = useRef<HTMLDivElement>(null);
     const emojiPickerRef = useRef<HTMLDivElement>(null);
-    const pickerTriggerRef = useRef<HTMLButtonElement>(null);
-    const stickerPickerRef = useRef<HTMLDivElement>(null);
-    const stickerPickerTriggerRef = useRef<HTMLButtonElement>(null);
+    const pickerTriggerRef = useRef<HTMLSpanElement>(null);
     const contentRef = useRef<HTMLDivElement>(null);
     const isLocalEditRef = useRef(false);
     const pendingCaretOffsetRef = useRef<number | null>(null);
@@ -4395,7 +4681,7 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
     );
 
     const autocompleteSuggestions = useMemo<Emoji[]>(
-        () => emojiMatch ? searchEmojis(emojiMatch.query, notice.guildId, 8) : [],
+        () => emojiMatch ? searchEmojis(emojiMatch.query, notice.guildId, 40).sort((a, b) => Number(Boolean(a.id)) - Number(Boolean(b.id))).slice(0, 8) : [],
         [emojiMatch, notice.guildId]
     );
     const placeholderSuggestions = useMemo(
@@ -4455,22 +4741,18 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         el.style.overflowY = el.scrollHeight > 200 ? "auto" : "hidden";
     }, [replyContent]);
     useEffect(() => {
-        if (!showEmojiPicker && !showStickerPicker) return;
+        if (!showEmojiPicker) return;
 
         function handleClick(event: MouseEvent) {
             if (pickerTriggerRef.current?.contains(event.target as Node)) return;
-            if (stickerPickerTriggerRef.current?.contains(event.target as Node)) return;
             if (emojiPickerRef.current && !emojiPickerRef.current.contains(event.target as Node)) {
                 setShowEmojiPicker(false);
-            }
-            if (stickerPickerRef.current && !stickerPickerRef.current.contains(event.target as Node)) {
-                setShowStickerPicker(false);
             }
         }
 
         document.addEventListener("mousedown", handleClick);
         return () => document.removeEventListener("mousedown", handleClick);
-    }, [showEmojiPicker, showStickerPicker]);
+    }, [showEmojiPicker]);
 
     const quickReactionEmojis = useMemo(
         () => getQuickReactionEmojis(notice.guildId),
@@ -4734,22 +5016,16 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
         void setReactionOnNotice(notice, emoji, !isReacted);
     }, [notice]);
 
-    const toggleEmojiPicker = useCallback((event: React.MouseEvent) => {
+    const pickerTabRef = useRef(pickerTab);
+    pickerTabRef.current = pickerTab;
+    const openPickerTab = useCallback((event: React.MouseEvent, tab: "gifs" | "stickers" | "emoji") => {
         event.preventDefault();
         event.stopPropagation();
         setPickerPos(getPickerPosition(event.currentTarget as HTMLButtonElement));
         setEmojiSearch("");
         setHoveredEmoji(null);
-        setShowStickerPicker(false);
-        setShowEmojiPicker(value => !value);
-    }, []);
-
-    const toggleStickerPicker = useCallback((event: React.MouseEvent) => {
-        event.preventDefault();
-        event.stopPropagation();
-        setStickerPickerPos(getPickerPosition(event.currentTarget as HTMLButtonElement));
-        setShowEmojiPicker(false);
-        setShowStickerPicker(value => !value);
+        setPickerTab(tab);
+        setShowEmojiPicker(open => !(open && pickerTabRef.current === tab));
     }, []);
 
     const reactWithPickerEmoji = useCallback((event: React.MouseEvent, emoji: Emoji, isReacted: boolean) => {
@@ -5159,36 +5435,14 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
                         )}
                         {(notice.reactions?.length ?? 0) > 0 && (
                             <div className="vc-mentions-box-message-reactions">
-                                {notice.reactions.map(reaction => {
-                                    const emojiKey = getStoredReactionKey(reaction);
-                                    const imgUrl = getEmojiImageUrl(reaction.emoji as any);
-                                    const isReacted = notice.reactedEmojiKeys.includes(emojiKey);
-
-                                    return (
-                                        <button
-                                            key={emojiKey}
-                                            type="button"
-                                            className={`vc-mentions-box-message-reaction${isReacted ? " vc-mentions-box-message-reaction--mine" : ""}`}
-                                            onClick={event => {
-                                                event.preventDefault();
-                                                event.stopPropagation();
-                                                void setReactionOnNotice(notice, reaction.emoji as any, !isReacted);
-                                            }}
-                                            aria-label={`${isReacted ? "Remove" : "React with"} ${reaction.emoji.name}`}
-                                            aria-pressed={isReacted}
-                                            title={reaction.emoji.name}
-                                        >
-                                        <PreviewImage
-                                            key={imgUrl}
-                                            url={imgUrl}
-                                            imageClass="vc-mentions-box-message-reaction-img"
-                                            fallbackClass={reaction.emoji.id ? "vc-mentions-box-emoji-fallback" : "vc-mentions-box-message-reaction-unicode"}
-                                            fallback={reaction.emoji.id ? `:${reaction.emoji.name}:` : reaction.emoji.name}
-                                        />
-                                            <span className="vc-mentions-box-message-reaction-count">{reaction.count}</span>
-                                        </button>
-                                    );
-                                })}
+                                {notice.reactions.map(reaction => (
+                                    <NoticeReaction
+                                        key={getStoredReactionKey(reaction)}
+                                        notice={notice}
+                                        reaction={reaction}
+                                        isReacted={notice.reactedEmojiKeys.includes(getStoredReactionKey(reaction))}
+                                    />
+                                ))}
                             </div>
                         )}
                         {hasReplyPreview && notice.referencedAuthorName && (
@@ -5247,16 +5501,35 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
                                         );
                                     })}
                                     <>
-                                        <button
-                                            ref={pickerTriggerRef}
-                                            type="button"
-                                            className="vc-mentions-box-reaction vc-mentions-box-reaction-more"
-                                            aria-label="Add reaction"
-                                            title="Add reaction"
-                                            onClick={toggleEmojiPicker}
-                                        >
-                                            ☺
-                                        </button>
+                                        <span ref={pickerTriggerRef} className="vc-mentions-box-picker-buttons">
+                                            <button
+                                                type="button"
+                                                className={"vc-mentions-box-reaction vc-mentions-box-reaction-more" + ((showEmojiPicker && pickerTab === "gifs") || ("gifs" === "stickers" && selectedSticker) ? " vc-mentions-box-reaction-selected" : "")}
+                                                aria-label="GIFs"
+                                                title="GIFs"
+                                                onClick={event => openPickerTab(event, "gifs")}
+                                            >
+                                                <span className="vc-mentions-box-gif-badge">GIF</span>
+                                            </button>
+                                            <button
+                                                type="button"
+                                                className={"vc-mentions-box-reaction vc-mentions-box-reaction-more" + ((showEmojiPicker && pickerTab === "stickers") || ("stickers" === "stickers" && selectedSticker) ? " vc-mentions-box-reaction-selected" : "")}
+                                                aria-label="Stickers"
+                                                title="Stickers"
+                                                onClick={event => openPickerTab(event, "stickers")}
+                                            >
+                                                <StickerIcon />
+                                            </button>
+                                            <button
+                                                type="button"
+                                                className={"vc-mentions-box-reaction vc-mentions-box-reaction-more" + ((showEmojiPicker && pickerTab === "emoji") || ("emoji" === "stickers" && selectedSticker) ? " vc-mentions-box-reaction-selected" : "")}
+                                                aria-label="Emoji"
+                                                title="Emoji"
+                                                onClick={event => openPickerTab(event, "emoji")}
+                                            >
+                                                <PickerIcon />
+                                            </button>
+                                        </span>
                                         {showEmojiPicker && pickerPos && ReactDOM.createPortal(
                                             <div
                                                 ref={emojiPickerRef}
@@ -5264,6 +5537,26 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
                                                 style={{ position: "fixed", top: pickerPos.top, right: pickerPos.right, zIndex: 10000 }}
                                                 onClick={event => event.stopPropagation()}
                                             >
+                                                <div className="vc-mentions-box-picker-tabs" role="tablist">
+                                                    {(["gifs", "stickers", "emoji"] as const).map(tab => (
+                                                        <button key={tab} type="button" role="tab" aria-selected={pickerTab === tab}
+                                                            className={"vc-mentions-box-picker-tab" + (pickerTab === tab ? " vc-mentions-box-picker-tab-active" : "")}
+                                                            onClick={() => setPickerTab(tab)}>
+                                                            {tab === "gifs" ? "GIFs" : tab === "stickers" ? "Stickers" : "Emoji"}
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                                {pickerTab === "stickers" && <MentionStickerPicker
+                                                    selectedId={selectedSticker?.id ?? null}
+                                                    onSelect={setSelectedSticker}
+                                                    closePopout={() => setShowEmojiPicker(false)}
+                                                />}
+                                                {pickerTab === "gifs" && <MentionGifPicker onSelect={url => {
+                                                    const input = replyInputRef.current;
+                                                    if (input && insertReplyContentAtSelection(input, url)) updateReplyFromEditor(input);
+                                                    setShowEmojiPicker(false);
+                                                }} />}
+                                                {pickerTab === "emoji" && <>
                                                 <div className="vc-mentions-box-emoji-picker-header">
                                                     <div className="vc-mentions-box-emoji-search-wrap">
                                                         <span className="vc-mentions-box-emoji-search-icon">🔍</span>
@@ -5336,36 +5629,11 @@ function MentionCard({ notice, onHandled }: { notice: MentionNotice; onHandled?:
                                                         </span>
                                                     </div>
                                                 )}
+                                                </>}
                                             </div>,
                                             document.body
                                         )}
-                                        <button
-                                            ref={stickerPickerTriggerRef}
-                                            type="button"
-                                            className={`vc-mentions-box-reaction vc-mentions-box-reaction-more vc-mentions-box-sticker-trigger${selectedSticker || showStickerPicker ? " vc-mentions-box-reaction-selected" : ""}`}
-                                            aria-label={selectedSticker ? `Selected sticker: ${selectedSticker.name}` : "Add sticker reply"}
-                                            title={selectedSticker ? `Sticker: ${selectedSticker.name}` : "Add sticker reply"}
-                                            aria-pressed={Boolean(selectedSticker || showStickerPicker)}
-                                            onClick={toggleStickerPicker}
-                                        >
-                                            ▣
-                                        </button>
-                                        {showStickerPicker && stickerPickerPos && ReactDOM.createPortal(
-                                            <div
-                                                ref={stickerPickerRef}
-                                                className="vc-mentions-box-sticker-picker"
-                                                style={{ position: "fixed", top: stickerPickerPos.top, right: stickerPickerPos.right, zIndex: 10000 }}
-                                                onClick={event => event.stopPropagation()}
-                                            >
-                                                <MentionStickerPicker
-                                                    selectedId={selectedSticker?.id ?? null}
-                                                    onSelect={setSelectedSticker}
-                                                    closePopout={() => setShowStickerPicker(false)}
-                                                />
-                                            </div>,
-                                            document.body
-                                        )}
-                                    </>
+                                                                            </>
                                 </div>}
                                 <div className="vc-mentions-box-actions-right">
                                     <button
@@ -5429,7 +5697,7 @@ Right-click to delete this response`}
                                 </div>
                             </div>
                         )}
-                        {isReplyExpanded && replyChain.length > 0 && <ReplyChain replies={replyChain} channelId={notice.channelId} />}
+                        {isReplyExpanded && replyChain.length > 0 && <ReplyChain replies={replyChain} channelId={notice.channelId} guildId={notice.guildId} />}
                         {isReplyExpanded && !replyChain.length && notice.referencedAuthorName && (
                             <div className="vc-mentions-box-ref">
                                 ↩ <span className="vc-mentions-box-ref-author">{notice.referencedAuthorName}</span>: {notice.referencedContent}
